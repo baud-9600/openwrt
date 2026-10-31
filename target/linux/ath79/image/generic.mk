@@ -11,6 +11,8 @@ DEVICE_VARS += KERNEL_INITRAMFS_PREFIX DAP_SIGNATURE
 DEVICE_VARS += EDIMAX_HEADER_MAGIC EDIMAX_HEADER_MODEL
 DEVICE_VARS += ELECOM_HWID
 DEVICE_VARS += MOXA_MAGIC MOXA_HWID
+DEVICE_VARS += DEADBEAF_MODEL_ID DEADBEAF_PART_OFFS DEADBEAF_ROOTFS_OFFS DEADBEAF_ROOTFS_SIZE
+DEVICE_VARS += DEADBEAF_KERNEL_VERSION DEADBEAF_ZLD_VERSION DEADBEAF_BUILD_DATE
 DEVICE_VARS += OPENMESH_CE_TYPE ZYXEL_MODEL_STRING
 DEVICE_VARS += SUPPORTED_TELTONIKA_DEVICES
 DEVICE_VARS += SUPPORTED_TELTONIKA_HW_MODS
@@ -167,6 +169,75 @@ define Build/zyxel-tar-bz2
 		$(if $(SOURCE_DATE_EPOCH),--mtime="@$(SOURCE_DATE_EPOCH)") \
 		. ./$(word 1,$(1)).lzma.uImage ./$(word 2,$(1))
 	rm -rf $@.tmp
+endef
+
+define Build/zyxel-deadbeaf
+	$(STAGING_DIR_HOST)/bin/mkdeadbeaf \
+		-B $(1) \
+		-k $(IMAGE_KERNEL) \
+		-r $(IMAGE_ROOTFS) \
+		-K $(LOADER_FLASH_OFFS) \
+		$(if $(DEADBEAF_MODEL_ID),-m $(DEADBEAF_MODEL_ID)) \
+		-o $@
+endef
+
+# Like zyxel-deadbeaf but splits the OKLI loader and kernel across sections
+# for factory installation via ZLD.
+#
+# ZLD maps section partition names to flash offsets from the partition table,
+# ignoring the flash_offset fields in section entries.  It writes the "kernel"
+# section to the kernel partition and "zldfs" to the zldfs partition.
+#
+# The kernel partition (1152k on NWA5123-AC) is too small for the combined
+# loader + compressed kernel.  Therefore:
+#   - s0 (kernel section): only the loader.uImage stub (padded, ~64k)
+#   - s1 (zldfs section):  OKLI compressed kernel + squashfs rootfs
+#
+# Flash layout after ZLD flashes the factory image:
+#   0x180000 (kernel):  [sub-header 512B] [loader.uImage]
+#   0x2A0000 (zldfs):   [OKLI kernel] [squashfs rootfs]
+#
+# The OKLI stub is compiled with LOADER_FLASH_OFFS pointing to the zldfs
+# partition start (0x2A0000), where the OKLI-magic kernel is found.
+# Build a loader uImage with load/entry = LZMA_TEXT_START instead of
+# KERNEL_LOADADDR.  Used by devices where the OKLI stub must run at the
+# address it was linked at (0x81800000) rather than the kernel load address.
+define Build/uImage-lzma-text-start
+	mkimage \
+		-A $(LINUX_KARCH) \
+		-O linux \
+		-T kernel \
+		-C lzma \
+		-a $(LZMA_TEXT_START) \
+		-e $(LZMA_TEXT_START) \
+		-n '$(call toupper,$(LINUX_KARCH)) $(VERSION_DIST) Linux-$(LINUX_VERSION)' \
+		-d $@ $@.new
+	mv $@.new $@
+endef
+
+define Build/zyxel-deadbeaf-loader
+	dd if=$(KDIR)/loader-$(DEVICE_NAME).uImage bs=65536 conv=sync > $@.kernel_blob
+	# Pad OKLI image + squashfs to the full nor1:zldfs partition size
+	# (13632k) with 0xFF so ZLD overwrites the writable overlay region
+	# with erased flash. Without this, jffs2 mistakes leftover stock-
+	# firmware bytes for an old filesystem on first boot.
+	# Build by first generating a $(DEADBEAF_ROOTFS_SIZE)-byte 0xFF canvas,
+	# then overwriting its head with the real payload.
+	head -c $(DEADBEAF_ROOTFS_SIZE) /dev/zero | tr '\000' '\377' > $@.rootfs_blob
+	cat $(IMAGE_KERNEL) $(IMAGE_ROOTFS) | \
+		dd of=$@.rootfs_blob conv=notrunc 2>/dev/null
+	$(STAGING_DIR_HOST)/bin/mkdeadbeaf \
+		-B $(1) \
+		-k $@.kernel_blob \
+		-r $@.rootfs_blob \
+		-K $(DEADBEAF_PART_OFFS) \
+		$(if $(DEADBEAF_ROOTFS_OFFS),-R $(DEADBEAF_ROOTFS_OFFS)) \
+		$(if $(DEADBEAF_MODEL_ID),-m $(DEADBEAF_MODEL_ID)) \
+		$(if $(DEADBEAF_KERNEL_VERSION),-V "$(DEADBEAF_KERNEL_VERSION)") \
+		$(if $(DEADBEAF_ZLD_VERSION),-Z "$(DEADBEAF_ZLD_VERSION)") \
+		$(if $(DEADBEAF_BUILD_DATE),-d "$(DEADBEAF_BUILD_DATE)") \
+		-o $@
+	rm -f $@.kernel_blob $@.rootfs_blob
 endef
 
 
@@ -3463,6 +3534,58 @@ define Device/zyxel_nwa1123-ni
   ZYXEL_MODEL_STRING := AAEO
 endef
 TARGET_DEVICES += zyxel_nwa1123-ni
+
+define Device/zyxel_nwa5123-ac
+  $(Device/loader-okli-uimage)
+  SOC := ar9344
+  DEVICE_VENDOR := Zyxel
+  DEVICE_MODEL := NWA5123-AC
+  DEVICE_PACKAGES := kmod-ath10k-ct-smallbuffers \
+	ath10k-firmware-qca988x-ct
+  # LOADER_FLASH_OFFS: flash offset where the OKLI stub searches for the
+  # OKLI-magic kernel.  ZLD writes the rootfs section (which contains the
+  # OKLI kernel prepended to squashfs) to the zldfs partition at 0x2A0000.
+  # DEADBEAF_PART_OFFS: flash offset of the kernel partition start, written
+  # into the deadbeaf header s0.flash_offset so ZLD knows where to write
+  # the loader stub; ZLD calls bootm at 0x1e000000 + 0x180000.
+  LOADER_FLASH_OFFS := 0x2A0000
+  LOADER_FLASH_BASE := 0x1e000000
+  LOADER_FLASH_MAX := 0x100000
+  LOADER_FLASH_CS1 := 1
+  # Zyxel ships NWA5123-AC units with bootImage=0 or bootImage=1 ex
+  # factory. ATNZ writes the inactive slot, so a bootImage=0 unit gets
+  # OpenWrt on CS1 (nor1:0x2a0000 = LOADER_FLASH_OFFS above) while a
+  # bootImage=1 unit gets it on CS0 (nor0:0x150000). Probe the CS0
+  # location first; the loader falls through to the CS1 SPI read when
+  # it doesn't find the OKLI magic there.
+  LOADER_FLASH_CS0_FALLBACK := 0x150000
+  DEADBEAF_PART_OFFS := 0x180000
+  DEADBEAF_ROOTFS_OFFS := 0x2A0000
+  DEADBEAF_ROOTFS_SIZE := 13631488
+  DEADBEAF_MODEL_ID := 0x000526e1
+  DEADBEAF_KERNEL_VERSION := $(LINUX_VERSION)
+  # ZLD identifies the rootfs section as "TYPE_LDFS" by position-sensitive
+  # match on s1.version: the format must be exactly "x.yy(###.z)" (11 chars
+  # + NUL) with the literal "###" placeholder at bytes 5..7. On flash ZLD
+  # substitutes "###" with a bootbase-hardcoded 4-char code ("AAZY" on
+  # NWA5123-AC) and writes "x.yy(AAZY.z) | DATE" into sub_hdr+0x80.
+  # 12-char variants ("99.99(###.0)") shift "###" out of the match window
+  # so ZLD reports <NULL> and leaves sub_hdr+0x80 empty, which keeps the
+  # image in "New"/"Fail" state and blocks auto-boot. "#" must be
+  # \-escaped for make.
+  DEADBEAF_ZLD_VERSION := 9.99(\#\#\#.0)
+  DEADBEAF_BUILD_DATE := $(shell date -u '+%Y-%m-%d %H:%M:%S')
+  # Override loader uImage load/entry to LZMA_TEXT_START (0x81800000) so
+  # U-Boot loads the stub at the address it was linked for. The default
+  # Build/uImage uses KERNEL_LOADADDR (0x80060000) which is wrong here.
+  COMPILE/loader-$(1).uImage := loader-okli-compile | pad-to 64k | \
+	lzma | uImage-lzma-text-start
+  KERNEL := kernel-bin | append-dtb | lzma | uImage lzma -M 0x4f4b4c49
+  IMAGE_SIZE := 14848k
+  IMAGES += factory.bin
+  IMAGE/factory.bin := zyxel-deadbeaf-loader NWA5123-AC
+endef
+TARGET_DEVICES += zyxel_nwa5123-ac
 
 define Device/zyxel_nbg6616
   SOC := qca9557
