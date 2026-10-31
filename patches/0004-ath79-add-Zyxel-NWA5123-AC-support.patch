@@ -1,0 +1,1145 @@
+From c4acc617167c2316b657b8ee0b71ef2823f8a87e Mon Sep 17 00:00:00 2001
+From: Manuel Kuklinski <mk@asdfghasdfgh.de>
+Date: Thu, 29 Oct 2026 15:13:01 +0000
+Subject: [PATCH 4/7] ath79: add Zyxel NWA5123-AC support
+
+Add device definition and factory image support for the Zyxel
+NWA5123-AC enterprise access point.
+
+- Add Build/zyxel-deadbeaf recipe using mkdeadbeaf to create
+  factory images in Zyxel's proprietary "deadbeaf" format,
+  flashable via the stock web UI
+- Add NWA5123-AC device definition with LOADER_FLASH_BASE=0x1e000000
+  (CS1) and LOADER_FLASH_OFFS=0x180000
+- Include mkdeadbeaf.c source (to be submitted to firmware-utils repo)
+- Include generated patch files for reference
+
+Note: mkdeadbeaf.c needs to be submitted separately to the
+openwrt/firmware-utils repository with a CMakeLists.txt entry:
+  FW_UTIL(mkdeadbeaf src/md5.c "" "")
+
+---
+ ...loader-add-CONFIG_FLASH_BASE-support.patch |  67 ++++
+ ...ass-LOADER_FLASH_BASE-to-lzma-loader.patch |  34 ++
+ ...3-ath79-add-Zyxel-NWA5123-AC-support.patch |  49 +++
+ .../0004-ath79-dts-add-Zyxel-NWA5123-AC.patch | 223 ++++++++++++
+ ...-add-mkdeadbeaf-for-Zyxel-NWA5123-AC.patch | 332 ++++++++++++++++++
+ scripts/mkdeadbeaf.c                          | 321 +++++++++++++++++
+ target/linux/ath79/image/generic.mk           |  26 ++
+ 7 files changed, 1052 insertions(+)
+ create mode 100644 patches/0001-ath79-lzma-loader-add-CONFIG_FLASH_BASE-support.patch
+ create mode 100644 patches/0002-ath79-image-pass-LOADER_FLASH_BASE-to-lzma-loader.patch
+ create mode 100644 patches/0003-ath79-add-Zyxel-NWA5123-AC-support.patch
+ create mode 100644 patches/0004-ath79-dts-add-Zyxel-NWA5123-AC.patch
+ create mode 100644 patches/0005-firmware-utils-add-mkdeadbeaf-for-Zyxel-NWA5123-AC.patch
+ create mode 100644 scripts/mkdeadbeaf.c
+
+diff --git a/patches/0001-ath79-lzma-loader-add-CONFIG_FLASH_BASE-support.patch b/patches/0001-ath79-lzma-loader-add-CONFIG_FLASH_BASE-support.patch
+new file mode 100644
+index 0000000..cf8ebaf
+--- /dev/null
++++ b/patches/0001-ath79-lzma-loader-add-CONFIG_FLASH_BASE-support.patch
+@@ -0,0 +1,67 @@
++From: OpenWrt <noreply@openwrt.org>
++Subject: [PATCH] ath79: ath79 lzma loader add CONFIG_FLASH_BASE support
++
++---
++diff --git a/target/linux/ath79/image/lzma-loader/Makefile b/target/linux/ath79/image/lzma-loader/Makefile
++index 2b1ed82..1b001e4 100644
++--- a/target/linux/ath79/image/lzma-loader/Makefile
+++++ b/target/linux/ath79/image/lzma-loader/Makefile
++@@ -17,6 +17,7 @@ KERNEL_MAGIC	:=
++ TARGET_DIR	:=
++ FLASH_OFFS	:=
++ FLASH_MAX	:=
+++FLASH_BASE	:=
++ BOARD		:=
++ 
++ ifeq ($(TARGET_DIR),)
++@@ -45,6 +46,7 @@ loader-compile: $(PKG_BUILD_DIR)/.prepared
++ 		KERNEL_MAGIC=$(KERNEL_MAGIC) \
++ 		FLASH_OFFS=$(FLASH_OFFS) \
++ 		FLASH_MAX=$(FLASH_MAX) \
+++		FLASH_BASE=$(FLASH_BASE) \
++ 		BOARD="$(BOARD)" \
++ 		clean all
++ 
++diff --git a/target/linux/ath79/image/lzma-loader/src/Makefile b/target/linux/ath79/image/lzma-loader/src/Makefile
++index c7bb935..7f9e621 100644
++--- a/target/linux/ath79/image/lzma-loader/src/Makefile
+++++ b/target/linux/ath79/image/lzma-loader/src/Makefile
++@@ -22,6 +22,7 @@ KERNEL_MAGIC	:=
++ BOARD		:=
++ FLASH_OFFS	:=
++ FLASH_MAX	:=
+++FLASH_BASE	:=
++ 
++ CC		:= $(CROSS_COMPILE)gcc
++ LD		:= $(CROSS_COMPILE)ld
++@@ -71,6 +72,10 @@ ifneq ($(strip $(FLASH_MAX)),)
++ CFLAGS		+= -DCONFIG_FLASH_MAX=$(FLASH_MAX)
++ endif
++ 
+++ifneq ($(strip $(FLASH_BASE)),)
+++CFLAGS		+= -DCONFIG_FLASH_BASE=$(FLASH_BASE)
+++endif
+++
++ BOARD_DEF := $(shell echo $(strip $(BOARD)) | tr a-z A-Z | tr - _)
++ ifneq ($(BOARD_DEF),)
++ CFLAGS		+= -DCONFIG_BOARD_$(BOARD_DEF)
++diff --git a/target/linux/ath79/image/lzma-loader/src/loader.c b/target/linux/ath79/image/lzma-loader/src/loader.c
++index 0213e94..96c9469 100644
++--- a/target/linux/ath79/image/lzma-loader/src/loader.c
+++++ b/target/linux/ath79/image/lzma-loader/src/loader.c
++@@ -27,8 +27,12 @@
++ #include "printf.h"
++ #include "LzmaDecode.h"
++ 
++-#define AR71XX_FLASH_START	0x1f000000
++-#define AR71XX_FLASH_END	0x1fe00000
+++#ifndef CONFIG_FLASH_BASE
+++#define CONFIG_FLASH_BASE	0x1f000000
+++#endif
+++
+++#define AR71XX_FLASH_START	CONFIG_FLASH_BASE
+++#define AR71XX_FLASH_END	(CONFIG_FLASH_BASE + 0x00e00000)
++ 
++ #define KSEG0			0x80000000
++ #define KSEG1			0xa0000000
++-- 
+diff --git a/patches/0002-ath79-image-pass-LOADER_FLASH_BASE-to-lzma-loader.patch b/patches/0002-ath79-image-pass-LOADER_FLASH_BASE-to-lzma-loader.patch
+new file mode 100644
+index 0000000..594b3dd
+--- /dev/null
++++ b/patches/0002-ath79-image-pass-LOADER_FLASH_BASE-to-lzma-loader.patch
+@@ -0,0 +1,34 @@
++From: OpenWrt <noreply@openwrt.org>
++Subject: [PATCH] ath79: ath79 image pass LOADER_FLASH_BASE to lzma loader
++
++---
++diff --git a/target/linux/ath79/image/Makefile b/target/linux/ath79/image/Makefile
++index 572da8c..2786135 100644
++--- a/target/linux/ath79/image/Makefile
+++++ b/target/linux/ath79/image/Makefile
++@@ -3,7 +3,7 @@ include $(INCLUDE_DIR)/image.mk
++ 
++ KERNEL_LOADADDR = 0x80060000
++ 
++-DEVICE_VARS += LOADER_FLASH_OFFS LOADER_TYPE
+++DEVICE_VARS += LOADER_FLASH_OFFS LOADER_FLASH_BASE LOADER_TYPE
++ DEVICE_VARS += LOADER_FLASH_MAX LOADER_KERNEL_MAGIC LZMA_TEXT_START
++ DEVICE_VARS += NETGEAR_BOARD_ID NETGEAR_HW_ID
++ DEVICE_VARS += RAS_BOARD RAS_ROOTFS_SIZE RAS_VERSION
++@@ -30,6 +30,7 @@ define Build/loader-okli-compile
++ 	$(call Build/loader-common, \
++ 		FLASH_OFFS=$(LOADER_FLASH_OFFS) \
++ 		FLASH_MAX=$(LOADER_FLASH_MAX) \
+++		FLASH_BASE=$(LOADER_FLASH_BASE) \
++ 		KERNEL_MAGIC=$(LOADER_KERNEL_MAGIC) \
++ 		BOARD="$(DEVICE_NAME)" )
++ endef
++@@ -78,6 +79,7 @@ endif
++   LOADER_KERNEL_MAGIC :=
++   LOADER_FLASH_MAX :=
++   LOADER_FLASH_OFFS :=
+++  LOADER_FLASH_BASE :=
++   LOADER_TYPE :=
++   LZMA_TEXT_START := 0x81800000
++   COMPILE :=
++-- 
+diff --git a/patches/0003-ath79-add-Zyxel-NWA5123-AC-support.patch b/patches/0003-ath79-add-Zyxel-NWA5123-AC-support.patch
+new file mode 100644
+index 0000000..e19a625
+--- /dev/null
++++ b/patches/0003-ath79-add-Zyxel-NWA5123-AC-support.patch
+@@ -0,0 +1,49 @@
++From: OpenWrt <noreply@openwrt.org>
++Subject: [PATCH] ath79: ath79 add Zyxel NWA5123 AC support
++
++---
++diff --git a/target/linux/ath79/image/generic.mk b/target/linux/ath79/image/generic.mk
++index ef156dd..409e4ec 100644
++--- a/target/linux/ath79/image/generic.mk
+++++ b/target/linux/ath79/image/generic.mk
++@@ -169,6 +169,15 @@ define Build/zyxel-tar-bz2
++ 	rm -rf $@.tmp
++ endef
++ 
+++define Build/zyxel-deadbeaf
+++	$(STAGING_DIR_HOST)/bin/mkdeadbeaf \
+++		-B $(1) \
+++		-k $(IMAGE_KERNEL) \
+++		-r $@ \
+++		-o $@.new
+++	mv $@.new $@
+++endef
+++
++ 
++ define Device/8dev_carambola2
++   SOC := ar9331
++@@ -3464,6 +3473,23 @@ define Device/zyxel_nwa1123-ni
++ endef
++ TARGET_DEVICES += zyxel_nwa1123-ni
++ 
+++define Device/zyxel_nwa5123-ac
+++  $(Device/loader-okli-uimage)
+++  SOC := ar9344
+++  DEVICE_VENDOR := Zyxel
+++  DEVICE_MODEL := NWA5123-AC
+++  DEVICE_PACKAGES := kmod-ath10k-ct-smallbuffers \
+++	ath10k-firmware-qca988x-ct
+++  LOADER_FLASH_OFFS := 0x180000
+++  LOADER_FLASH_BASE := 0x1e000000
+++  KERNEL := kernel-bin | append-dtb | lzma | uImage lzma -M 0x4f4b4c49
+++  IMAGE_SIZE := 14848k
+++  IMAGES += factory.bin
+++  IMAGE/factory.bin := append-kernel | pad-to $$$$(BLOCKSIZE) | \
+++	append-rootfs | pad-rootfs | check-size | zyxel-deadbeaf NWA5123-AC
+++endef
+++TARGET_DEVICES += zyxel_nwa5123-ac
+++
++ define Device/zyxel_nbg6616
++   SOC := qca9557
++   DEVICE_VENDOR := Zyxel
++-- 
+diff --git a/patches/0004-ath79-dts-add-Zyxel-NWA5123-AC.patch b/patches/0004-ath79-dts-add-Zyxel-NWA5123-AC.patch
+new file mode 100644
+index 0000000..b63ce79
+--- /dev/null
++++ b/patches/0004-ath79-dts-add-Zyxel-NWA5123-AC.patch
+@@ -0,0 +1,223 @@
++From: OpenWrt <noreply@openwrt.org>
++Subject: [PATCH] ath79: ath79 dts add Zyxel NWA5123 AC
++
++---
++diff --git a/target/linux/ath79/dts/ar9344_zyxel_nwa5123-ac.dts b/target/linux/ath79/dts/ar9344_zyxel_nwa5123-ac.dts
++new file mode 100644
++index 0000000..6ca52c6
++--- /dev/null
+++++ b/target/linux/ath79/dts/ar9344_zyxel_nwa5123-ac.dts
++@@ -0,0 +1,212 @@
+++// SPDX-License-Identifier: GPL-2.0-or-later OR MIT
+++
+++#include "ar9344.dtsi"
+++
+++#include <dt-bindings/gpio/gpio.h>
+++#include <dt-bindings/input/input.h>
+++#include <dt-bindings/leds/common.h>
+++#include <dt-bindings/mtd/partitions/uimage.h>
+++
+++/ {
+++	model = "Zyxel NWA5123-AC";
+++	compatible = "zyxel,nwa5123-ac", "qca,ar9344";
+++
+++	aliases {
+++		label-mac-device = &eth0;
+++		led-boot = &led_status_green;
+++		led-failsafe = &led_status_amber;
+++		led-running = &led_status_green;
+++		led-upgrade = &led_status_amber;
+++	};
+++
+++	leds {
+++		compatible = "gpio-leds";
+++
+++		led_status_green: status_green {
+++			function = LED_FUNCTION_STATUS;
+++			color = <LED_COLOR_ID_GREEN>;
+++			gpios = <&gpio 12 GPIO_ACTIVE_LOW>;
+++			default-state = "on";
+++		};
+++
+++		led_status_amber: status_amber {
+++			function = LED_FUNCTION_STATUS;
+++			color = <LED_COLOR_ID_AMBER>;
+++			gpios = <&gpio 11 GPIO_ACTIVE_LOW>;
+++		};
+++	};
+++
+++	keys {
+++		compatible = "gpio-keys";
+++
+++		reset {
+++			label = "reset";
+++			linux,code = <KEY_RESTART>;
+++			gpios = <&gpio 4 GPIO_ACTIVE_LOW>;
+++		};
+++	};
+++};
+++
+++&ref {
+++	clock-frequency = <40000000>;
+++};
+++
+++&spi {
+++	status = "okay";
+++
+++	/* CS0: boot flash */
+++	flash@0 {
+++		compatible = "jedec,spi-nor";
+++		reg = <0>;
+++		spi-max-frequency = <50000000>;
+++
+++		partitions {
+++			compatible = "fixed-partitions";
+++			#address-cells = <1>;
+++			#size-cells = <1>;
+++
+++			partition@0 {
+++				label = "u-boot";
+++				reg = <0x000000 0x040000>;
+++				read-only;
+++			};
+++
+++			partition@40000 {
+++				label = "u-boot-env";
+++				reg = <0x040000 0x010000>;
+++			};
+++
+++			partition@50000 {
+++				label = "loader";
+++				reg = <0x050000 0x010000>;
+++				read-only;
+++			};
+++
+++			partition@fa0000 {
+++				label = "config";
+++				reg = <0xfa0000 0x040000>;
+++				read-only;
+++			};
+++
+++			partition@fe0000 {
+++				label = "mib0";
+++				reg = <0xfe0000 0x010000>;
+++				read-only;
+++
+++				nvmem-layout {
+++					compatible = "fixed-layout";
+++					#address-cells = <1>;
+++					#size-cells = <1>;
+++
+++					macaddr_mib0_4b: macaddr@4b {
+++						compatible = "mac-base";
+++						reg = <0x4b 0x11>;
+++						#nvmem-cell-cells = <1>;
+++					};
+++
+++					macaddr_mib0_66: macaddr@66 {
+++						compatible = "mac-base";
+++						reg = <0x66 0x11>;
+++						#nvmem-cell-cells = <1>;
+++					};
+++				};
+++			};
+++
+++			partition@ff0000 {
+++				label = "art";
+++				reg = <0xff0000 0x010000>;
+++				read-only;
+++
+++				nvmem-layout {
+++					compatible = "fixed-layout";
+++					#address-cells = <1>;
+++					#size-cells = <1>;
+++
+++					calibration_ath9k: calibration@1000 {
+++						reg = <0x1000 0x440>;
+++					};
+++
+++					macaddr_art_1002: macaddr@1002 {
+++						reg = <0x1002 0x6>;
+++					};
+++				};
+++			};
+++		};
+++	};
+++
+++	/* CS1: firmware flash */
+++	flash@1 {
+++		compatible = "jedec,spi-nor";
+++		reg = <1>;
+++		spi-max-frequency = <50000000>;
+++
+++		partitions {
+++			compatible = "fixed-partitions";
+++			#address-cells = <1>;
+++			#size-cells = <1>;
+++
+++			partition@0 {
+++				label = "reserve";
+++				reg = <0x000000 0x180000>;
+++				read-only;
+++			};
+++
+++			partition@180000 {
+++				compatible = "openwrt,uimage", "denx,uimage";
+++				openwrt,ih-magic = <IH_MAGIC_OKLI>;
+++				label = "firmware";
+++				reg = <0x180000 0xe80000>;
+++			};
+++		};
+++	};
+++};
+++
+++&pcie {
+++	status = "okay";
+++
+++	wifi@0,0 {
+++		compatible = "qcom,ath10k";
+++		reg = <0x0000 0 0 0 0>;
+++		nvmem-cells = <&macaddr_mib0_66 0>;
+++		nvmem-cell-names = "mac-address";
+++	};
+++};
+++
+++&mdio0 {
+++	status = "okay";
+++
+++	phy0: ethernet-phy@0 {
+++		reg = <0>;
+++		phy-mode = "rgmii";
+++	};
+++};
+++
+++&eth0 {
+++	status = "okay";
+++
+++	pll-data = <0x06000000 0x00000101 0x00001313>;
+++
+++	nvmem-cells = <&macaddr_art_1002>;
+++	nvmem-cell-names = "mac-address";
+++
+++	phy-mode = "rgmii-id";
+++	phy-handle = <&phy0>;
+++
+++	gmac-config {
+++		device = <&gmac>;
+++		rxdv-delay = <3>;
+++		rxd-delay = <3>;
+++		txen-delay = <3>;
+++		txd-delay = <3>;
+++		rgmii-gmac0 = <1>;
+++	};
+++};
+++
+++&wmac {
+++	status = "okay";
+++
+++	ieee80211-freq-limit = <2402000 2482000>;
+++
+++	nvmem-cells = <&macaddr_mib0_4b 0>, <&calibration_ath9k>;
+++	nvmem-cell-names = "mac-address", "calibration";
+++};
++-- 
+diff --git a/patches/0005-firmware-utils-add-mkdeadbeaf-for-Zyxel-NWA5123-AC.patch b/patches/0005-firmware-utils-add-mkdeadbeaf-for-Zyxel-NWA5123-AC.patch
+new file mode 100644
+index 0000000..4dc353b
+--- /dev/null
++++ b/patches/0005-firmware-utils-add-mkdeadbeaf-for-Zyxel-NWA5123-AC.patch
+@@ -0,0 +1,332 @@
++From: OpenWrt <noreply@openwrt.org>
++Subject: [PATCH] ath79: firmware utils add mkdeadbeaf for Zyxel NWA5123 AC
++
++---
++diff --git a/scripts/mkdeadbeaf.c b/scripts/mkdeadbeaf.c
++new file mode 100644
++index 0000000..472b918
++--- /dev/null
+++++ b/scripts/mkdeadbeaf.c
++@@ -0,0 +1,321 @@
+++// SPDX-License-Identifier: GPL-2.0-or-later
+++/*
+++ * mkdeadbeaf - Build Zyxel "deadbeaf" firmware images
+++ *
+++ * Used by: NWA5123-AC and similar Zyxel NWA access points
+++ *
+++ * The firmware file has a 648-byte header followed by kernel and rootfs data.
+++ * Checksums use MD5 word-sum: sum of 4 big-endian 32-bit words from the
+++ * MD5 digest, mod 2^32 (returns 1 if result is 0).
+++ *
+++ * Copyright (C) 2024 OpenWrt.org
+++ */
+++
+++#include <byteswap.h>
+++#include <endian.h>
+++#include <errno.h>
+++#include <fcntl.h>
+++#include <getopt.h>
+++#include <stdint.h>
+++#include <stdio.h>
+++#include <stdlib.h>
+++#include <string.h>
+++#include <sys/stat.h>
+++#include <unistd.h>
+++
+++#include "md5.h"
+++
+++#if __BYTE_ORDER == __BIG_ENDIAN
+++#define cpu_to_be16(x) (x)
+++#define cpu_to_be32(x) (x)
+++#elif __BYTE_ORDER == __LITTLE_ENDIAN
+++#define cpu_to_be16(x) bswap_16(x)
+++#define cpu_to_be32(x) bswap_32(x)
+++#else
+++#error "unsupported endianness"
+++#endif
+++
+++#define DEADBEAF_MAGIC		0xDEADBEAF
+++#define PRE_HEADER_SIZE		108
+++#define SECTION_ENTRY0_SIZE	272
+++#define SECTION_ENTRY1_SIZE	268
+++#define KERNEL_SUB_HDR_SIZE	512
+++#define HEADER_SIZE		(PRE_HEADER_SIZE + SECTION_ENTRY0_SIZE + SECTION_ENTRY1_SIZE)
+++#define FILENAME_LEN		64
+++#define PARTITION_LEN		64
+++
+++/* Default flash offsets for NWA5123-AC */
+++#define DEFAULT_KERNEL_OFFSET	0x00180000
+++#define DEFAULT_ROOTFS_OFFSET	0x002A0000
+++
+++struct deadbeaf_header {
+++	uint32_t master_crc;
+++	uint32_t magic;
+++	uint32_t type;
+++	uint32_t model_id;
+++	uint32_t reserved1;
+++	uint32_t reserved2;
+++	uint32_t file_size;
+++	uint16_t header_size;
+++	uint16_t pre_header_size;
+++	uint32_t flags;
+++	uint8_t  pad1[4];
+++	char     version[32];
+++	char     board[32];
+++	uint16_t num_sections;
+++	uint16_t pad2;
+++} __attribute__((packed));
+++
+++struct section_entry0 {
+++	uint32_t size;
+++	uint32_t checksum;
+++	uint32_t flash_offset;
+++	char     filename[FILENAME_LEN];
+++	char     partition[PARTITION_LEN];
+++	uint8_t  pad[SECTION_ENTRY0_SIZE - 12 - FILENAME_LEN - PARTITION_LEN];
+++} __attribute__((packed));
+++
+++struct section_entry1 {
+++	uint32_t size;
+++	uint32_t checksum;
+++	uint32_t flash_offset;
+++	char     filename[FILENAME_LEN];
+++	char     partition[PARTITION_LEN];
+++	uint8_t  pad[SECTION_ENTRY1_SIZE - 12 - FILENAME_LEN - PARTITION_LEN];
+++} __attribute__((packed));
+++
+++static const char *progname;
+++
+++static uint32_t md5ws(const void *data, size_t len)
+++{
+++	MD5_CTX ctx;
+++	uint8_t digest[16];
+++	uint32_t w[4], sum;
+++	int i;
+++
+++	MD5_Init(&ctx);
+++	MD5_Update(&ctx, data, len);
+++	MD5_Final(digest, &ctx);
+++
+++	for (i = 0; i < 4; i++)
+++		w[i] = ((uint32_t)digest[i * 4] << 24) |
+++		       ((uint32_t)digest[i * 4 + 1] << 16) |
+++		       ((uint32_t)digest[i * 4 + 2] << 8) |
+++		       ((uint32_t)digest[i * 4 + 3]);
+++
+++	sum = (w[0] + w[1] + w[2] + w[3]) & 0xFFFFFFFF;
+++	return sum ? sum : 1;
+++}
+++
+++static void *map_file(const char *path, size_t *size)
+++{
+++	struct stat st;
+++	FILE *fp;
+++	void *buf;
+++
+++	if (stat(path, &st)) {
+++		fprintf(stderr, "%s: stat %s: %s\n", progname, path,
+++			strerror(errno));
+++		return NULL;
+++	}
+++	*size = st.st_size;
+++
+++	buf = malloc(*size);
+++	if (!buf) {
+++		fprintf(stderr, "%s: malloc(%zu): %s\n", progname, *size,
+++			strerror(errno));
+++		return NULL;
+++	}
+++
+++	fp = fopen(path, "rb");
+++	if (!fp) {
+++		fprintf(stderr, "%s: open %s: %s\n", progname, path,
+++			strerror(errno));
+++		free(buf);
+++		return NULL;
+++	}
+++
+++	if (fread(buf, 1, *size, fp) != *size) {
+++		fprintf(stderr, "%s: short read on %s\n", progname, path);
+++		fclose(fp);
+++		free(buf);
+++		return NULL;
+++	}
+++
+++	fclose(fp);
+++	return buf;
+++}
+++
+++static void usage(int status)
+++{
+++	fprintf(stderr,
+++		"Usage: %s [OPTIONS]\n"
+++		"  -B <board>     board name (required)\n"
+++		"  -k <file>      kernel image (required)\n"
+++		"  -r <file>      rootfs image (required)\n"
+++		"  -o <file>      output file (required)\n"
+++		"  -v <version>   firmware version string (default: 1.00.00)\n"
+++		"  -K <offset>    kernel flash offset (default: 0x%x)\n"
+++		"  -R <offset>    rootfs flash offset (default: 0x%x)\n"
+++		"  -h             show this help\n",
+++		progname, DEFAULT_KERNEL_OFFSET, DEFAULT_ROOTFS_OFFSET);
+++	exit(status);
+++}
+++
+++int main(int argc, char *argv[])
+++{
+++	struct deadbeaf_header hdr;
+++	struct section_entry0 s0;
+++	struct section_entry1 s1;
+++	uint8_t sub_hdr[KERNEL_SUB_HDR_SIZE];
+++	const char *board = NULL, *kernel_path = NULL;
+++	const char *rootfs_path = NULL, *output_path = NULL;
+++	const char *version = "1.00.00";
+++	uint32_t kernel_offset = DEFAULT_KERNEL_OFFSET;
+++	uint32_t rootfs_offset = DEFAULT_ROOTFS_OFFSET;
+++	void *kernel_data, *rootfs_data, *file_buf;
+++	size_t kernel_size, rootfs_size, file_size;
+++	char name_buf[FILENAME_LEN];
+++	FILE *fp;
+++	int opt, i;
+++
+++	progname = argv[0];
+++
+++	while ((opt = getopt(argc, argv, "B:k:r:o:v:K:R:h")) != -1) {
+++		switch (opt) {
+++		case 'B':
+++			board = optarg;
+++			break;
+++		case 'k':
+++			kernel_path = optarg;
+++			break;
+++		case 'r':
+++			rootfs_path = optarg;
+++			break;
+++		case 'o':
+++			output_path = optarg;
+++			break;
+++		case 'v':
+++			version = optarg;
+++			break;
+++		case 'K':
+++			kernel_offset = strtoul(optarg, NULL, 0);
+++			break;
+++		case 'R':
+++			rootfs_offset = strtoul(optarg, NULL, 0);
+++			break;
+++		case 'h':
+++			usage(0);
+++		default:
+++			usage(1);
+++		}
+++	}
+++
+++	if (!board || !kernel_path || !rootfs_path || !output_path) {
+++		fprintf(stderr, "%s: missing required arguments\n", progname);
+++		usage(1);
+++	}
+++
+++	kernel_data = map_file(kernel_path, &kernel_size);
+++	if (!kernel_data)
+++		return 1;
+++
+++	rootfs_data = map_file(rootfs_path, &rootfs_size);
+++	if (!rootfs_data)
+++		return 1;
+++
+++	/* Section 0 includes 512-byte sub-header + kernel */
+++	file_size = HEADER_SIZE + KERNEL_SUB_HDR_SIZE + kernel_size + rootfs_size;
+++
+++	/* Build pre-header */
+++	memset(&hdr, 0, sizeof(hdr));
+++	hdr.master_crc = 0; /* placeholder */
+++	hdr.magic = cpu_to_be32(DEADBEAF_MAGIC);
+++	hdr.type = cpu_to_be32(0x01000002);
+++	hdr.model_id = 0;
+++	hdr.reserved1 = cpu_to_be32(0xFFFFFFFF);
+++	hdr.reserved2 = cpu_to_be32(0xFFFFFFFF);
+++	hdr.file_size = cpu_to_be32(file_size);
+++	hdr.header_size = cpu_to_be16(HEADER_SIZE);
+++	hdr.pre_header_size = cpu_to_be16(PRE_HEADER_SIZE);
+++	hdr.flags = cpu_to_be32(0x01100000);
+++	strncpy(hdr.version, version, sizeof(hdr.version) - 1);
+++	strncpy(hdr.board, board, sizeof(hdr.board) - 1);
+++	hdr.num_sections = cpu_to_be16(2);
+++
+++	/* Build section entry 0 (kernel) */
+++	memset(&s0, 0, sizeof(s0));
+++	s0.size = cpu_to_be32(KERNEL_SUB_HDR_SIZE + kernel_size);
+++	s0.checksum = cpu_to_be32(md5ws(kernel_data, kernel_size));
+++	s0.flash_offset = cpu_to_be32(kernel_offset);
+++
+++	/* Build filename: "kernel<board_lowercase>.bin" */
+++	memset(name_buf, 0, sizeof(name_buf));
+++	snprintf(name_buf, sizeof(name_buf), "kernel");
+++	i = strlen(name_buf);
+++	strncpy(name_buf + i, board, sizeof(name_buf) - i - 5);
+++	for (; name_buf[i]; i++)
+++		if (name_buf[i] >= 'A' && name_buf[i] <= 'Z')
+++			name_buf[i] += 'a' - 'A';
+++	strncat(name_buf, ".bin", sizeof(name_buf) - strlen(name_buf) - 1);
+++	strncpy(s0.filename, name_buf, FILENAME_LEN - 1);
+++	strncpy(s0.partition, "kernel", PARTITION_LEN - 1);
+++
+++	/* Build section entry 1 (rootfs) */
+++	memset(&s1, 0, sizeof(s1));
+++	s1.size = cpu_to_be32(rootfs_size);
+++	s1.checksum = cpu_to_be32(md5ws(rootfs_data, rootfs_size));
+++	s1.flash_offset = cpu_to_be32(rootfs_offset);
+++	strncpy(s1.filename, "squashfs_ro.img", FILENAME_LEN - 1);
+++	strncpy(s1.partition, "zldfs", PARTITION_LEN - 1);
+++
+++	/* Kernel sub-header is all zeros for OpenWrt images */
+++	memset(sub_hdr, 0, sizeof(sub_hdr));
+++
+++	/* Assemble the complete file in memory for master checksum */
+++	file_buf = malloc(file_size);
+++	if (!file_buf) {
+++		fprintf(stderr, "%s: malloc(%zu) failed\n", progname, file_size);
+++		return 1;
+++	}
+++
+++	memcpy(file_buf, &hdr, sizeof(hdr));
+++	memcpy(file_buf + PRE_HEADER_SIZE, &s0, sizeof(s0));
+++	memcpy(file_buf + PRE_HEADER_SIZE + SECTION_ENTRY0_SIZE, &s1, sizeof(s1));
+++	memcpy(file_buf + HEADER_SIZE, sub_hdr, sizeof(sub_hdr));
+++	memcpy(file_buf + HEADER_SIZE + KERNEL_SUB_HDR_SIZE,
+++	       kernel_data, kernel_size);
+++	memcpy(file_buf + HEADER_SIZE + KERNEL_SUB_HDR_SIZE + kernel_size,
+++	       rootfs_data, rootfs_size);
+++
+++	/* Compute master checksum: md5ws(file[4:]) */
+++	{
+++		uint32_t master = md5ws((uint8_t *)file_buf + 4, file_size - 4);
+++		((struct deadbeaf_header *)file_buf)->master_crc =
+++			cpu_to_be32(master);
+++	}
+++
+++	/* Write output */
+++	fp = fopen(output_path, "wb");
+++	if (!fp) {
+++		fprintf(stderr, "%s: open %s: %s\n", progname, output_path,
+++			strerror(errno));
+++		return 1;
+++	}
+++
+++	if (fwrite(file_buf, 1, file_size, fp) != file_size) {
+++		fprintf(stderr, "%s: write error\n", progname);
+++		fclose(fp);
+++		return 1;
+++	}
+++
+++	fclose(fp);
+++	free(file_buf);
+++	free(kernel_data);
+++	free(rootfs_data);
+++
+++	fprintf(stderr, "%s: %s kernel=%zu rootfs=%zu total=%zu\n",
+++		progname, board, kernel_size, rootfs_size, file_size);
+++
+++	return 0;
+++}
++-- 
+diff --git a/scripts/mkdeadbeaf.c b/scripts/mkdeadbeaf.c
+new file mode 100644
+index 0000000..472b918
+--- /dev/null
++++ b/scripts/mkdeadbeaf.c
+@@ -0,0 +1,321 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * mkdeadbeaf - Build Zyxel "deadbeaf" firmware images
++ *
++ * Used by: NWA5123-AC and similar Zyxel NWA access points
++ *
++ * The firmware file has a 648-byte header followed by kernel and rootfs data.
++ * Checksums use MD5 word-sum: sum of 4 big-endian 32-bit words from the
++ * MD5 digest, mod 2^32 (returns 1 if result is 0).
++ *
++ * Copyright (C) 2024 OpenWrt.org
++ */
++
++#include <byteswap.h>
++#include <endian.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <getopt.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++#include "md5.h"
++
++#if __BYTE_ORDER == __BIG_ENDIAN
++#define cpu_to_be16(x) (x)
++#define cpu_to_be32(x) (x)
++#elif __BYTE_ORDER == __LITTLE_ENDIAN
++#define cpu_to_be16(x) bswap_16(x)
++#define cpu_to_be32(x) bswap_32(x)
++#else
++#error "unsupported endianness"
++#endif
++
++#define DEADBEAF_MAGIC		0xDEADBEAF
++#define PRE_HEADER_SIZE		108
++#define SECTION_ENTRY0_SIZE	272
++#define SECTION_ENTRY1_SIZE	268
++#define KERNEL_SUB_HDR_SIZE	512
++#define HEADER_SIZE		(PRE_HEADER_SIZE + SECTION_ENTRY0_SIZE + SECTION_ENTRY1_SIZE)
++#define FILENAME_LEN		64
++#define PARTITION_LEN		64
++
++/* Default flash offsets for NWA5123-AC */
++#define DEFAULT_KERNEL_OFFSET	0x00180000
++#define DEFAULT_ROOTFS_OFFSET	0x002A0000
++
++struct deadbeaf_header {
++	uint32_t master_crc;
++	uint32_t magic;
++	uint32_t type;
++	uint32_t model_id;
++	uint32_t reserved1;
++	uint32_t reserved2;
++	uint32_t file_size;
++	uint16_t header_size;
++	uint16_t pre_header_size;
++	uint32_t flags;
++	uint8_t  pad1[4];
++	char     version[32];
++	char     board[32];
++	uint16_t num_sections;
++	uint16_t pad2;
++} __attribute__((packed));
++
++struct section_entry0 {
++	uint32_t size;
++	uint32_t checksum;
++	uint32_t flash_offset;
++	char     filename[FILENAME_LEN];
++	char     partition[PARTITION_LEN];
++	uint8_t  pad[SECTION_ENTRY0_SIZE - 12 - FILENAME_LEN - PARTITION_LEN];
++} __attribute__((packed));
++
++struct section_entry1 {
++	uint32_t size;
++	uint32_t checksum;
++	uint32_t flash_offset;
++	char     filename[FILENAME_LEN];
++	char     partition[PARTITION_LEN];
++	uint8_t  pad[SECTION_ENTRY1_SIZE - 12 - FILENAME_LEN - PARTITION_LEN];
++} __attribute__((packed));
++
++static const char *progname;
++
++static uint32_t md5ws(const void *data, size_t len)
++{
++	MD5_CTX ctx;
++	uint8_t digest[16];
++	uint32_t w[4], sum;
++	int i;
++
++	MD5_Init(&ctx);
++	MD5_Update(&ctx, data, len);
++	MD5_Final(digest, &ctx);
++
++	for (i = 0; i < 4; i++)
++		w[i] = ((uint32_t)digest[i * 4] << 24) |
++		       ((uint32_t)digest[i * 4 + 1] << 16) |
++		       ((uint32_t)digest[i * 4 + 2] << 8) |
++		       ((uint32_t)digest[i * 4 + 3]);
++
++	sum = (w[0] + w[1] + w[2] + w[3]) & 0xFFFFFFFF;
++	return sum ? sum : 1;
++}
++
++static void *map_file(const char *path, size_t *size)
++{
++	struct stat st;
++	FILE *fp;
++	void *buf;
++
++	if (stat(path, &st)) {
++		fprintf(stderr, "%s: stat %s: %s\n", progname, path,
++			strerror(errno));
++		return NULL;
++	}
++	*size = st.st_size;
++
++	buf = malloc(*size);
++	if (!buf) {
++		fprintf(stderr, "%s: malloc(%zu): %s\n", progname, *size,
++			strerror(errno));
++		return NULL;
++	}
++
++	fp = fopen(path, "rb");
++	if (!fp) {
++		fprintf(stderr, "%s: open %s: %s\n", progname, path,
++			strerror(errno));
++		free(buf);
++		return NULL;
++	}
++
++	if (fread(buf, 1, *size, fp) != *size) {
++		fprintf(stderr, "%s: short read on %s\n", progname, path);
++		fclose(fp);
++		free(buf);
++		return NULL;
++	}
++
++	fclose(fp);
++	return buf;
++}
++
++static void usage(int status)
++{
++	fprintf(stderr,
++		"Usage: %s [OPTIONS]\n"
++		"  -B <board>     board name (required)\n"
++		"  -k <file>      kernel image (required)\n"
++		"  -r <file>      rootfs image (required)\n"
++		"  -o <file>      output file (required)\n"
++		"  -v <version>   firmware version string (default: 1.00.00)\n"
++		"  -K <offset>    kernel flash offset (default: 0x%x)\n"
++		"  -R <offset>    rootfs flash offset (default: 0x%x)\n"
++		"  -h             show this help\n",
++		progname, DEFAULT_KERNEL_OFFSET, DEFAULT_ROOTFS_OFFSET);
++	exit(status);
++}
++
++int main(int argc, char *argv[])
++{
++	struct deadbeaf_header hdr;
++	struct section_entry0 s0;
++	struct section_entry1 s1;
++	uint8_t sub_hdr[KERNEL_SUB_HDR_SIZE];
++	const char *board = NULL, *kernel_path = NULL;
++	const char *rootfs_path = NULL, *output_path = NULL;
++	const char *version = "1.00.00";
++	uint32_t kernel_offset = DEFAULT_KERNEL_OFFSET;
++	uint32_t rootfs_offset = DEFAULT_ROOTFS_OFFSET;
++	void *kernel_data, *rootfs_data, *file_buf;
++	size_t kernel_size, rootfs_size, file_size;
++	char name_buf[FILENAME_LEN];
++	FILE *fp;
++	int opt, i;
++
++	progname = argv[0];
++
++	while ((opt = getopt(argc, argv, "B:k:r:o:v:K:R:h")) != -1) {
++		switch (opt) {
++		case 'B':
++			board = optarg;
++			break;
++		case 'k':
++			kernel_path = optarg;
++			break;
++		case 'r':
++			rootfs_path = optarg;
++			break;
++		case 'o':
++			output_path = optarg;
++			break;
++		case 'v':
++			version = optarg;
++			break;
++		case 'K':
++			kernel_offset = strtoul(optarg, NULL, 0);
++			break;
++		case 'R':
++			rootfs_offset = strtoul(optarg, NULL, 0);
++			break;
++		case 'h':
++			usage(0);
++		default:
++			usage(1);
++		}
++	}
++
++	if (!board || !kernel_path || !rootfs_path || !output_path) {
++		fprintf(stderr, "%s: missing required arguments\n", progname);
++		usage(1);
++	}
++
++	kernel_data = map_file(kernel_path, &kernel_size);
++	if (!kernel_data)
++		return 1;
++
++	rootfs_data = map_file(rootfs_path, &rootfs_size);
++	if (!rootfs_data)
++		return 1;
++
++	/* Section 0 includes 512-byte sub-header + kernel */
++	file_size = HEADER_SIZE + KERNEL_SUB_HDR_SIZE + kernel_size + rootfs_size;
++
++	/* Build pre-header */
++	memset(&hdr, 0, sizeof(hdr));
++	hdr.master_crc = 0; /* placeholder */
++	hdr.magic = cpu_to_be32(DEADBEAF_MAGIC);
++	hdr.type = cpu_to_be32(0x01000002);
++	hdr.model_id = 0;
++	hdr.reserved1 = cpu_to_be32(0xFFFFFFFF);
++	hdr.reserved2 = cpu_to_be32(0xFFFFFFFF);
++	hdr.file_size = cpu_to_be32(file_size);
++	hdr.header_size = cpu_to_be16(HEADER_SIZE);
++	hdr.pre_header_size = cpu_to_be16(PRE_HEADER_SIZE);
++	hdr.flags = cpu_to_be32(0x01100000);
++	strncpy(hdr.version, version, sizeof(hdr.version) - 1);
++	strncpy(hdr.board, board, sizeof(hdr.board) - 1);
++	hdr.num_sections = cpu_to_be16(2);
++
++	/* Build section entry 0 (kernel) */
++	memset(&s0, 0, sizeof(s0));
++	s0.size = cpu_to_be32(KERNEL_SUB_HDR_SIZE + kernel_size);
++	s0.checksum = cpu_to_be32(md5ws(kernel_data, kernel_size));
++	s0.flash_offset = cpu_to_be32(kernel_offset);
++
++	/* Build filename: "kernel<board_lowercase>.bin" */
++	memset(name_buf, 0, sizeof(name_buf));
++	snprintf(name_buf, sizeof(name_buf), "kernel");
++	i = strlen(name_buf);
++	strncpy(name_buf + i, board, sizeof(name_buf) - i - 5);
++	for (; name_buf[i]; i++)
++		if (name_buf[i] >= 'A' && name_buf[i] <= 'Z')
++			name_buf[i] += 'a' - 'A';
++	strncat(name_buf, ".bin", sizeof(name_buf) - strlen(name_buf) - 1);
++	strncpy(s0.filename, name_buf, FILENAME_LEN - 1);
++	strncpy(s0.partition, "kernel", PARTITION_LEN - 1);
++
++	/* Build section entry 1 (rootfs) */
++	memset(&s1, 0, sizeof(s1));
++	s1.size = cpu_to_be32(rootfs_size);
++	s1.checksum = cpu_to_be32(md5ws(rootfs_data, rootfs_size));
++	s1.flash_offset = cpu_to_be32(rootfs_offset);
++	strncpy(s1.filename, "squashfs_ro.img", FILENAME_LEN - 1);
++	strncpy(s1.partition, "zldfs", PARTITION_LEN - 1);
++
++	/* Kernel sub-header is all zeros for OpenWrt images */
++	memset(sub_hdr, 0, sizeof(sub_hdr));
++
++	/* Assemble the complete file in memory for master checksum */
++	file_buf = malloc(file_size);
++	if (!file_buf) {
++		fprintf(stderr, "%s: malloc(%zu) failed\n", progname, file_size);
++		return 1;
++	}
++
++	memcpy(file_buf, &hdr, sizeof(hdr));
++	memcpy(file_buf + PRE_HEADER_SIZE, &s0, sizeof(s0));
++	memcpy(file_buf + PRE_HEADER_SIZE + SECTION_ENTRY0_SIZE, &s1, sizeof(s1));
++	memcpy(file_buf + HEADER_SIZE, sub_hdr, sizeof(sub_hdr));
++	memcpy(file_buf + HEADER_SIZE + KERNEL_SUB_HDR_SIZE,
++	       kernel_data, kernel_size);
++	memcpy(file_buf + HEADER_SIZE + KERNEL_SUB_HDR_SIZE + kernel_size,
++	       rootfs_data, rootfs_size);
++
++	/* Compute master checksum: md5ws(file[4:]) */
++	{
++		uint32_t master = md5ws((uint8_t *)file_buf + 4, file_size - 4);
++		((struct deadbeaf_header *)file_buf)->master_crc =
++			cpu_to_be32(master);
++	}
++
++	/* Write output */
++	fp = fopen(output_path, "wb");
++	if (!fp) {
++		fprintf(stderr, "%s: open %s: %s\n", progname, output_path,
++			strerror(errno));
++		return 1;
++	}
++
++	if (fwrite(file_buf, 1, file_size, fp) != file_size) {
++		fprintf(stderr, "%s: write error\n", progname);
++		fclose(fp);
++		return 1;
++	}
++
++	fclose(fp);
++	free(file_buf);
++	free(kernel_data);
++	free(rootfs_data);
++
++	fprintf(stderr, "%s: %s kernel=%zu rootfs=%zu total=%zu\n",
++		progname, board, kernel_size, rootfs_size, file_size);
++
++	return 0;
++}
+diff --git a/target/linux/ath79/image/generic.mk b/target/linux/ath79/image/generic.mk
+index ef156dd..409e4ec 100644
+--- a/target/linux/ath79/image/generic.mk
++++ b/target/linux/ath79/image/generic.mk
+@@ -169,6 +169,15 @@ define Build/zyxel-tar-bz2
+ 	rm -rf $@.tmp
+ endef
+ 
++define Build/zyxel-deadbeaf
++	$(STAGING_DIR_HOST)/bin/mkdeadbeaf \
++		-B $(1) \
++		-k $(IMAGE_KERNEL) \
++		-r $@ \
++		-o $@.new
++	mv $@.new $@
++endef
++
+ 
+ define Device/8dev_carambola2
+   SOC := ar9331
+@@ -3464,6 +3473,23 @@ define Device/zyxel_nwa1123-ni
+ endef
+ TARGET_DEVICES += zyxel_nwa1123-ni
+ 
++define Device/zyxel_nwa5123-ac
++  $(Device/loader-okli-uimage)
++  SOC := ar9344
++  DEVICE_VENDOR := Zyxel
++  DEVICE_MODEL := NWA5123-AC
++  DEVICE_PACKAGES := kmod-ath10k-ct-smallbuffers \
++	ath10k-firmware-qca988x-ct
++  LOADER_FLASH_OFFS := 0x180000
++  LOADER_FLASH_BASE := 0x1e000000
++  KERNEL := kernel-bin | append-dtb | lzma | uImage lzma -M 0x4f4b4c49
++  IMAGE_SIZE := 14848k
++  IMAGES += factory.bin
++  IMAGE/factory.bin := append-kernel | pad-to $$$$(BLOCKSIZE) | \
++	append-rootfs | pad-rootfs | check-size | zyxel-deadbeaf NWA5123-AC
++endef
++TARGET_DEVICES += zyxel_nwa5123-ac
++
+ define Device/zyxel_nbg6616
+   SOC := qca9557
+   DEVICE_VENDOR := Zyxel
+-- 
+2.43.0
+

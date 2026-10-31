@@ -1,0 +1,246 @@
+From 5f1b5074054dd710c57e63849c614c068fae1a51 Mon Sep 17 00:00:00 2001
+From: Manuel Kuklinski <mk@asdfghasdfgh.de>
+Date: Thu, 29 Oct 2026 15:12:51 +0000
+Subject: [PATCH 3/7] ath79: dts: add Zyxel NWA5123-AC device tree
+
+Add device tree for the Zyxel NWA5123-AC dual-band enterprise AP.
+
+Hardware:
+- SoC: Qualcomm Atheros AR9344 (MIPS 74Kc)
+- RAM: 128 MB DDR2
+- Flash: Dual 16 MB SPI NOR (CS0: boot, CS1: firmware)
+- 2.4 GHz: AR9344 built-in (ath9k)
+- 5 GHz: QCA9882 PCIe (ath10k)
+- Ethernet: 1x GbE RGMII
+- LEDs: green/amber status
+- Button: reset
+
+The firmware partition is on the secondary SPI flash (CS1) starting
+at offset 0x180000. MAC addresses are in the mib0 partition on CS0.
+
+---
+ .../ath79/dts/ar9344_zyxel_nwa5123-ac.dts     | 212 ++++++++++++++++++
+ 1 file changed, 212 insertions(+)
+ create mode 100644 target/linux/ath79/dts/ar9344_zyxel_nwa5123-ac.dts
+
+diff --git a/target/linux/ath79/dts/ar9344_zyxel_nwa5123-ac.dts b/target/linux/ath79/dts/ar9344_zyxel_nwa5123-ac.dts
+new file mode 100644
+index 0000000..6ca52c6
+--- /dev/null
++++ b/target/linux/ath79/dts/ar9344_zyxel_nwa5123-ac.dts
+@@ -0,0 +1,212 @@
++// SPDX-License-Identifier: GPL-2.0-or-later OR MIT
++
++#include "ar9344.dtsi"
++
++#include <dt-bindings/gpio/gpio.h>
++#include <dt-bindings/input/input.h>
++#include <dt-bindings/leds/common.h>
++#include <dt-bindings/mtd/partitions/uimage.h>
++
++/ {
++	model = "Zyxel NWA5123-AC";
++	compatible = "zyxel,nwa5123-ac", "qca,ar9344";
++
++	aliases {
++		label-mac-device = &eth0;
++		led-boot = &led_status_green;
++		led-failsafe = &led_status_amber;
++		led-running = &led_status_green;
++		led-upgrade = &led_status_amber;
++	};
++
++	leds {
++		compatible = "gpio-leds";
++
++		led_status_green: status_green {
++			function = LED_FUNCTION_STATUS;
++			color = <LED_COLOR_ID_GREEN>;
++			gpios = <&gpio 12 GPIO_ACTIVE_LOW>;
++			default-state = "on";
++		};
++
++		led_status_amber: status_amber {
++			function = LED_FUNCTION_STATUS;
++			color = <LED_COLOR_ID_AMBER>;
++			gpios = <&gpio 11 GPIO_ACTIVE_LOW>;
++		};
++	};
++
++	keys {
++		compatible = "gpio-keys";
++
++		reset {
++			label = "reset";
++			linux,code = <KEY_RESTART>;
++			gpios = <&gpio 4 GPIO_ACTIVE_LOW>;
++		};
++	};
++};
++
++&ref {
++	clock-frequency = <40000000>;
++};
++
++&spi {
++	status = "okay";
++
++	/* CS0: boot flash */
++	flash@0 {
++		compatible = "jedec,spi-nor";
++		reg = <0>;
++		spi-max-frequency = <50000000>;
++
++		partitions {
++			compatible = "fixed-partitions";
++			#address-cells = <1>;
++			#size-cells = <1>;
++
++			partition@0 {
++				label = "u-boot";
++				reg = <0x000000 0x040000>;
++				read-only;
++			};
++
++			partition@40000 {
++				label = "u-boot-env";
++				reg = <0x040000 0x010000>;
++			};
++
++			partition@50000 {
++				label = "loader";
++				reg = <0x050000 0x010000>;
++				read-only;
++			};
++
++			partition@fa0000 {
++				label = "config";
++				reg = <0xfa0000 0x040000>;
++				read-only;
++			};
++
++			partition@fe0000 {
++				label = "mib0";
++				reg = <0xfe0000 0x010000>;
++				read-only;
++
++				nvmem-layout {
++					compatible = "fixed-layout";
++					#address-cells = <1>;
++					#size-cells = <1>;
++
++					macaddr_mib0_4b: macaddr@4b {
++						compatible = "mac-base";
++						reg = <0x4b 0x11>;
++						#nvmem-cell-cells = <1>;
++					};
++
++					macaddr_mib0_66: macaddr@66 {
++						compatible = "mac-base";
++						reg = <0x66 0x11>;
++						#nvmem-cell-cells = <1>;
++					};
++				};
++			};
++
++			partition@ff0000 {
++				label = "art";
++				reg = <0xff0000 0x010000>;
++				read-only;
++
++				nvmem-layout {
++					compatible = "fixed-layout";
++					#address-cells = <1>;
++					#size-cells = <1>;
++
++					calibration_ath9k: calibration@1000 {
++						reg = <0x1000 0x440>;
++					};
++
++					macaddr_art_1002: macaddr@1002 {
++						reg = <0x1002 0x6>;
++					};
++				};
++			};
++		};
++	};
++
++	/* CS1: firmware flash */
++	flash@1 {
++		compatible = "jedec,spi-nor";
++		reg = <1>;
++		spi-max-frequency = <50000000>;
++
++		partitions {
++			compatible = "fixed-partitions";
++			#address-cells = <1>;
++			#size-cells = <1>;
++
++			partition@0 {
++				label = "reserve";
++				reg = <0x000000 0x180000>;
++				read-only;
++			};
++
++			partition@180000 {
++				compatible = "openwrt,uimage", "denx,uimage";
++				openwrt,ih-magic = <IH_MAGIC_OKLI>;
++				label = "firmware";
++				reg = <0x180000 0xe80000>;
++			};
++		};
++	};
++};
++
++&pcie {
++	status = "okay";
++
++	wifi@0,0 {
++		compatible = "qcom,ath10k";
++		reg = <0x0000 0 0 0 0>;
++		nvmem-cells = <&macaddr_mib0_66 0>;
++		nvmem-cell-names = "mac-address";
++	};
++};
++
++&mdio0 {
++	status = "okay";
++
++	phy0: ethernet-phy@0 {
++		reg = <0>;
++		phy-mode = "rgmii";
++	};
++};
++
++&eth0 {
++	status = "okay";
++
++	pll-data = <0x06000000 0x00000101 0x00001313>;
++
++	nvmem-cells = <&macaddr_art_1002>;
++	nvmem-cell-names = "mac-address";
++
++	phy-mode = "rgmii-id";
++	phy-handle = <&phy0>;
++
++	gmac-config {
++		device = <&gmac>;
++		rxdv-delay = <3>;
++		rxd-delay = <3>;
++		txen-delay = <3>;
++		txd-delay = <3>;
++		rgmii-gmac0 = <1>;
++	};
++};
++
++&wmac {
++	status = "okay";
++
++	ieee80211-freq-limit = <2402000 2482000>;
++
++	nvmem-cells = <&macaddr_mib0_4b 0>, <&calibration_ath9k>;
++	nvmem-cell-names = "mac-address", "calibration";
++};
+-- 
+2.43.0
+

@@ -1,0 +1,129 @@
+From 99a6f6518b9358ba75306138563b8260f151b584 Mon Sep 17 00:00:00 2001
+From: Manuel Kuklinski <mk@asdfghasdfgh.de>
+Date: Thu, 29 Oct 2026 18:28:48 +0000
+Subject: [PATCH 7/7] scripts: mkdeadbeaf: fix data offset and checksum (Zyxel
+ +4 quirk)
+
+The header_size field must store DATA_OFFSET (648) = HEADER_SIZE - 4,
+not HEADER_SIZE (652).  The ZLD bootloader uses this field as the byte
+offset where section data begins, so storing 652 shifted all section
+data 4 bytes late, causing 'extract fail = -5'.
+
+Analysis of the original Zyxel NWA5123-AC firmware (500AAZY3C0.bin)
+confirms:
+  - header_size field = 648 (not 652)
+  - data starts at file offset 648
+  - s0.checksum = md5ws(kernel only, skipping the 512-byte sub-header)
+  - The last 4 bytes of s1.pad (at 648..651) overlap with the first 4
+    bytes of the sub-header; both are zeros so there is no conflict
+
+---
+ scripts/mkdeadbeaf.c | 44 +++++++++++++++++++++++++++++++++++---------
+ 1 file changed, 35 insertions(+), 9 deletions(-)
+
+diff --git a/scripts/mkdeadbeaf.c b/scripts/mkdeadbeaf.c
+index 3ccc40d..3421ead 100644
+--- a/scripts/mkdeadbeaf.c
++++ b/scripts/mkdeadbeaf.c
+@@ -4,11 +4,19 @@
+  *
+  * Used by: NWA5123-AC and similar Zyxel NWA access points
+  *
+- * Header layout (652 bytes total):
++ * Header layout (652 bytes, but header_size field = 648):
+  *   - pre-header:    108 bytes (includes magic, sizes, board, num_sections)
+  *   - section_entry: 272 bytes (kernel)
+  *   - section_entry: 272 bytes (rootfs)
+  *
++ * The header_size field stores 648 (= 652 - 4, Zyxel "+4 quirk").
++ * The ZLD bootloader uses header_size as the data start offset, so data
++ * begins at byte 648.  The last 4 bytes of the s1.pad overlap with the
++ * first 4 bytes of the kernel sub-header; both are zeros, so no conflict.
++ *
++ * Section 0 (kernel): size = KERNEL_SUB_HDR_SIZE + kernel_size.
++ *   checksum covers the kernel data only (excluding the 512-byte sub-header).
++ *
+  * Checksums use MD5 word-sum: sum of 4 big-endian 32-bit words from the
+  * MD5 digest, mod 2^32 (returns 1 if result is 0).
+  *
+@@ -43,7 +51,14 @@
+ #define PRE_HEADER_SIZE		108
+ #define SECTION_ENTRY_SIZE	272
+ #define KERNEL_SUB_HDR_SIZE	512
++/*
++ * DATA_OFFSET is where the ZLD bootloader begins reading section data.
++ * It equals the value stored in the header_size field (648), which is 4 less
++ * than the actual struct end (652).  The last 4 bytes of the s1 pad overlap
++ * with the first 4 bytes of the kernel sub-header; both are zeros.
++ */
+ #define HEADER_SIZE		(PRE_HEADER_SIZE + 2 * SECTION_ENTRY_SIZE)
++#define DATA_OFFSET		(HEADER_SIZE - 4)
+ #define FILENAME_LEN		64
+ #define PARTITION_LEN		64
+ #define BLOCKSIZE		0x10000	/* 64k flash erase block */
+@@ -213,13 +228,14 @@ int main(int argc, char *argv[])
+ 	if (!rootfs_data)
+ 		return 1;
+ 
+-	/* Rootfs follows kernel on flash, aligned to erase block */
++	/* Rootfs follows kernel on flash, aligned to erase block.
++	 * The flash section for the kernel holds the sub-header + kernel data. */
+ 	rootfs_offset = kernel_offset +
+-		((kernel_size + KERNEL_SUB_HDR_SIZE + BLOCKSIZE - 1) /
++		((KERNEL_SUB_HDR_SIZE + kernel_size + BLOCKSIZE - 1) /
+ 		 BLOCKSIZE) * BLOCKSIZE;
+ 
+-	/* Total file: header + 512-byte sub-header + kernel + rootfs */
+-	file_size = HEADER_SIZE + KERNEL_SUB_HDR_SIZE + kernel_size + rootfs_size;
++	/* Total file: data at DATA_OFFSET + sub-header + kernel + rootfs */
++	file_size = DATA_OFFSET + KERNEL_SUB_HDR_SIZE + kernel_size + rootfs_size;
+ 
+ 	/* Build pre-header */
+ 	memset(&hdr, 0, sizeof(hdr));
+@@ -230,7 +246,7 @@ int main(int argc, char *argv[])
+ 	hdr.reserved1     = cpu_to_be32(0xFFFFFFFF);
+ 	hdr.reserved2     = cpu_to_be32(0xFFFFFFFF);
+ 	hdr.file_size     = cpu_to_be32(file_size);
+-	hdr.header_size   = cpu_to_be16(HEADER_SIZE);
++	hdr.header_size   = cpu_to_be16(DATA_OFFSET); /* ZLD reads data at this offset */
+ 	hdr.pre_header_size = cpu_to_be16(PRE_HEADER_SIZE);
+ 	hdr.flags         = cpu_to_be32(0x01100000);
+ 	strncpy(hdr.version, version, sizeof(hdr.version) - 1);
+@@ -240,6 +256,7 @@ int main(int argc, char *argv[])
+ 	/* Build section entry 0 (kernel) */
+ 	memset(&s0, 0, sizeof(s0));
+ 	s0.size         = cpu_to_be32(KERNEL_SUB_HDR_SIZE + kernel_size);
++	/* Checksum covers kernel data only, NOT the 512-byte sub-header */
+ 	s0.checksum     = cpu_to_be32(md5ws(kernel_data, kernel_size));
+ 	s0.flash_offset = cpu_to_be32(kernel_offset);
+ 
+@@ -273,14 +290,23 @@ int main(int argc, char *argv[])
+ 		return 1;
+ 	}
+ 
++	/*
++	 * Write header structs into a zero-initialised buffer.  The header
++	 * occupies 652 bytes but data_offset (= header_size field) = 648, so
++	 * the last 4 bytes of s1.pad overlap with the first 4 bytes of the
++	 * sub-header.  Both are zero; memset(file_buf, 0) + the copies below
++	 * produce the correct layout without any special handling.
++	 */
++	memset(file_buf, 0, file_size);
+ 	memcpy(file_buf, &hdr, sizeof(hdr));
+ 	memcpy((uint8_t *)file_buf + PRE_HEADER_SIZE, &s0, sizeof(s0));
+ 	memcpy((uint8_t *)file_buf + PRE_HEADER_SIZE + SECTION_ENTRY_SIZE,
+ 	       &s1, sizeof(s1));
+-	memcpy((uint8_t *)file_buf + HEADER_SIZE, sub_hdr, sizeof(sub_hdr));
+-	memcpy((uint8_t *)file_buf + HEADER_SIZE + KERNEL_SUB_HDR_SIZE,
++	/* sub-header and payload begin at DATA_OFFSET (= 648) */
++	memcpy((uint8_t *)file_buf + DATA_OFFSET, sub_hdr, sizeof(sub_hdr));
++	memcpy((uint8_t *)file_buf + DATA_OFFSET + KERNEL_SUB_HDR_SIZE,
+ 	       kernel_data, kernel_size);
+-	memcpy((uint8_t *)file_buf + HEADER_SIZE + KERNEL_SUB_HDR_SIZE +
++	memcpy((uint8_t *)file_buf + DATA_OFFSET + KERNEL_SUB_HDR_SIZE +
+ 	       kernel_size, rootfs_data, rootfs_size);
+ 
+ 	/* Master checksum: md5ws(file[4:]) */
+-- 
+2.43.0
+

@@ -1,0 +1,84 @@
+From 2d7cc35b0faba05edc3c6ad69ba103b5277a9b46 Mon Sep 17 00:00:00 2001
+From: Manuel Kuklinski <mk@asdfghasdfgh.de>
+Date: Thu, 29 Oct 2026 15:12:38 +0000
+Subject: [PATCH 1/7] ath79: lzma-loader: add CONFIG_FLASH_BASE support
+
+Devices with firmware on a secondary SPI flash (CS1, mapped at
+0x1e000000) need the OKLI lzma-loader to scan the correct address
+range. Add CONFIG_FLASH_BASE to override the default CS0 base
+(0x1f000000), passed through the Makefile chain as FLASH_BASE.
+
+This is needed for dual-flash devices like the Zyxel NWA5123-AC
+where the boot flash is on CS0 but firmware lives on CS1.
+
+---
+ target/linux/ath79/image/lzma-loader/Makefile     | 2 ++
+ target/linux/ath79/image/lzma-loader/src/Makefile | 5 +++++
+ target/linux/ath79/image/lzma-loader/src/loader.c | 8 ++++++--
+ 3 files changed, 13 insertions(+), 2 deletions(-)
+
+diff --git a/target/linux/ath79/image/lzma-loader/Makefile b/target/linux/ath79/image/lzma-loader/Makefile
+index 2b1ed82..1b001e4 100644
+--- a/target/linux/ath79/image/lzma-loader/Makefile
++++ b/target/linux/ath79/image/lzma-loader/Makefile
+@@ -17,6 +17,7 @@ KERNEL_MAGIC	:=
+ TARGET_DIR	:=
+ FLASH_OFFS	:=
+ FLASH_MAX	:=
++FLASH_BASE	:=
+ BOARD		:=
+ 
+ ifeq ($(TARGET_DIR),)
+@@ -45,6 +46,7 @@ loader-compile: $(PKG_BUILD_DIR)/.prepared
+ 		KERNEL_MAGIC=$(KERNEL_MAGIC) \
+ 		FLASH_OFFS=$(FLASH_OFFS) \
+ 		FLASH_MAX=$(FLASH_MAX) \
++		FLASH_BASE=$(FLASH_BASE) \
+ 		BOARD="$(BOARD)" \
+ 		clean all
+ 
+diff --git a/target/linux/ath79/image/lzma-loader/src/Makefile b/target/linux/ath79/image/lzma-loader/src/Makefile
+index c7bb935..7f9e621 100644
+--- a/target/linux/ath79/image/lzma-loader/src/Makefile
++++ b/target/linux/ath79/image/lzma-loader/src/Makefile
+@@ -22,6 +22,7 @@ KERNEL_MAGIC	:=
+ BOARD		:=
+ FLASH_OFFS	:=
+ FLASH_MAX	:=
++FLASH_BASE	:=
+ 
+ CC		:= $(CROSS_COMPILE)gcc
+ LD		:= $(CROSS_COMPILE)ld
+@@ -71,6 +72,10 @@ ifneq ($(strip $(FLASH_MAX)),)
+ CFLAGS		+= -DCONFIG_FLASH_MAX=$(FLASH_MAX)
+ endif
+ 
++ifneq ($(strip $(FLASH_BASE)),)
++CFLAGS		+= -DCONFIG_FLASH_BASE=$(FLASH_BASE)
++endif
++
+ BOARD_DEF := $(shell echo $(strip $(BOARD)) | tr a-z A-Z | tr - _)
+ ifneq ($(BOARD_DEF),)
+ CFLAGS		+= -DCONFIG_BOARD_$(BOARD_DEF)
+diff --git a/target/linux/ath79/image/lzma-loader/src/loader.c b/target/linux/ath79/image/lzma-loader/src/loader.c
+index 0213e94..96c9469 100644
+--- a/target/linux/ath79/image/lzma-loader/src/loader.c
++++ b/target/linux/ath79/image/lzma-loader/src/loader.c
+@@ -27,8 +27,12 @@
+ #include "printf.h"
+ #include "LzmaDecode.h"
+ 
+-#define AR71XX_FLASH_START	0x1f000000
+-#define AR71XX_FLASH_END	0x1fe00000
++#ifndef CONFIG_FLASH_BASE
++#define CONFIG_FLASH_BASE	0x1f000000
++#endif
++
++#define AR71XX_FLASH_START	CONFIG_FLASH_BASE
++#define AR71XX_FLASH_END	(CONFIG_FLASH_BASE + 0x00e00000)
+ 
+ #define KSEG0			0x80000000
+ #define KSEG1			0xa0000000
+-- 
+2.43.0
+
