@@ -22,6 +22,7 @@ KERNEL_MAGIC	:=
 BOARD		:=
 FLASH_OFFS	:=
 FLASH_MAX	:=
+FLASH_BASE	:=
 
 CC		:= $(CROSS_COMPILE)gcc
 LD		:= $(CROSS_COMPILE)ld
@@ -69,6 +70,18 @@ endif
 
 ifneq ($(strip $(FLASH_MAX)),)
 CFLAGS		+= -DCONFIG_FLASH_MAX=$(FLASH_MAX)
+endif
+
+ifneq ($(strip $(FLASH_BASE)),)
+CFLAGS		+= -DCONFIG_FLASH_BASE=$(FLASH_BASE)
+endif
+
+ifneq ($(strip $(FLASH_CS1)),)
+CFLAGS		+= -DCONFIG_FLASH_CS1=1
+endif
+
+ifneq ($(strip $(FLASH_CS0_FALLBACK)),)
+CFLAGS		+= -DCONFIG_FLASH_CS0_FALLBACK=$(FLASH_CS0_FALLBACK)
 endif
 
 BOARD_DEF := $(shell echo $(strip $(BOARD)) | tr a-z A-Z | tr - _)
