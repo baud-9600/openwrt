@@ -1,0 +1,455 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -128,1 +128,2 @@
+ FW_UTIL(zyxbcm "" "" "")
++FW_UTIL(mkdeadbeaf src/md5.c "" "")
+
+--- /dev/null
++++ b/src/mkdeadbeaf.c
+@@ -0,0 +1,446 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * mkdeadbeaf - Build Zyxel "deadbeaf" firmware images
++ *
++ * Used by: NWA5123-AC and similar Zyxel NWA access points.
++ *
++ * File layout (matching Zyxel's own tool):
++ *   [0:108]      pre-header   (magic, model_id, sizes, version, board, ...)
++ *   [108:380]    section 0 entry (272 bytes)
++ *   [380:652]    section 1 entry (272 bytes)
++ *   [648:1160]   sub-header   (512 bytes, overlaps last 4 bytes of s1 entry)
++ *   [1160:...]   section 0 kernel data (uImage)
++ *   [...:...]    section 1 rootfs data
++ *
++ * header_size is set to 648; ZLD treats bytes [648:1160) as the sub-header
++ * region and the uImage magic as being at byte 1160 (= flash kernel partition
++ * + 512). ZLD displays the version/date strings embedded in each section
++ * entry's padding (offset 204 and 236).
++ *
++ * Checksums (all md5 word-sum: sum of 4 big-endian 32-bit words from the
++ * MD5 digest, mod 2^32, with 0 remapped to 1):
++ *   - s0.checksum: md5ws over the kernel bytes only (file[1160:1160+kernel])
++ *   - s1.checksum: md5ws over the entire rootfs
++ *   - master_crc:  md5ws(file[4:]) with the 512 sub-header bytes [648:1160)
++ *                  temporarily zeroed; stored both at file[0:4] and inside
++ *                  the sub-header at offset 264.
++ *
++ * Copyright (C) 2024 OpenWrt.org
++ */
++
++#include <byteswap.h>
++#include <endian.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <getopt.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++#include "md5.h"
++
++#if __BYTE_ORDER == __BIG_ENDIAN
++#define cpu_to_be16(x) (x)
++#define cpu_to_be32(x) (x)
++#elif __BYTE_ORDER == __LITTLE_ENDIAN
++#define cpu_to_be16(x) bswap_16(x)
++#define cpu_to_be32(x) bswap_32(x)
++#else
++#error "unsupported endianness"
++#endif
++
++#define DEADBEAF_MAGIC		0xDEADBEAFU
++#define PRE_HEADER_SIZE		108
++#define SECTION_ENTRY_SIZE	272
++#define HEADER_SIZE		648
++#define SUB_HDR_SIZE		512
++#define SUB_HDR_OFFSET		HEADER_SIZE          /* = 648 */
++#define KERNEL_DATA_OFFSET	(HEADER_SIZE + SUB_HDR_SIZE) /* = 1160 */
++#define FILENAME_LEN		64
++#define PARTITION_LEN		64
++#define VERSION_LEN		32
++#define DATE_LEN		32
++#define BLOCKSIZE		0x10000	/* 64k flash erase block */
++
++#define DEFAULT_KERNEL_OFFSET	0x00180000
++#define DEFAULT_ROOTFS_OFFSET	0x002A0000
++#define DEFAULT_MODEL_ID	0
++
++/* Sub-header checksum field offsets (bytes within the 512-byte sub-header). */
++#define SUBHDR_OFF_S0_CHECKSUM	260
++#define SUBHDR_OFF_MASTER_CRC	264
++#define SUBHDR_OFF_S1_CHECKSUM	268
++#define SUBHDR_OFF_MODEL_ID	272
++
++struct deadbeaf_header {
++	uint32_t master_crc;
++	uint32_t magic;
++	uint32_t type;
++	uint32_t model_id;
++	uint32_t reserved1;
++	uint32_t reserved2;
++	uint32_t file_size;
++	uint16_t header_size;
++	uint16_t pre_header_size;
++	uint32_t flags;
++	uint8_t  pad1[4];
++	char     version[32];
++	char     board[32];
++	uint16_t num_sections;
++	uint16_t pad2;
++} __attribute__((packed));
++
++struct section_entry {
++	uint32_t size;
++	uint32_t checksum;
++	uint32_t flash_offset;
++	char     filename[FILENAME_LEN];
++	char     partition[PARTITION_LEN];
++	uint8_t  pad_a[64];
++	char     version[VERSION_LEN];      /* offset 204 within section_entry */
++	char     date[DATE_LEN];            /* offset 236 */
++	uint32_t trailer;                   /* offset 268 */
++} __attribute__((packed));
++
++/*
++ * Sub-header template, extracted verbatim from stock Zyxel firmware
++ * 610AAZY8C0.bin (NWA5123-AC ZLD 6.10 AAZY.8). ZLD displays and validates
++ * fields in this blob; its exact structure is proprietary. The three
++ * checksum slots at offsets 260/264/268 are overwritten with values that
++ * match the current build.
++ */
++static const uint8_t subhdr_template[SUB_HDR_SIZE] = {
++	0x00, 0x00, 0x4e, 0x57, 0x41, 0x35, 0x31, 0x32, 0x33, 0x2d, 0x41, 0x43, 0x00, 0x00, 0x46, 0x46,
++	0x00, 0x46, 0x46, 0x46, 0x46, 0x00, 0x46, 0x46, 0x46, 0x46, 0x00, 0x00, 0x7a, 0x6c, 0x64, 0x66,
++	0x73, 0x00, 0x36, 0x2e, 0x31, 0x30, 0x28, 0x23, 0x23, 0x23, 0x2e, 0x38, 0x29, 0x00, 0x32, 0x30,
++	0x32, 0x30, 0x2d, 0x31, 0x30, 0x2d, 0x30, 0x36, 0x20, 0x31, 0x32, 0x3a, 0x35, 0x38, 0x3a, 0x31,
++	0x32, 0x2e, 0x36, 0x2e, 0x33, 0x31, 0x20, 0x7c, 0x20, 0x32, 0x30, 0x32, 0x30, 0x2d, 0x31, 0x30,
++	0x2d, 0x30, 0x36, 0x20, 0x31, 0x32, 0x3a, 0x34, 0x35, 0x3a, 0x34, 0x33, 0x00, 0x00, 0x00, 0x00,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++	0x36, 0x2e, 0x31, 0x30, 0x28, 0x23, 0x23, 0x23, 0x2e, 0x38, 0x29, 0x20, 0x7c, 0x20, 0x32, 0x30,
++	0x32, 0x30, 0x2d, 0x31, 0x30, 0x2d, 0x30, 0x36, 0x20, 0x31, 0x32, 0x3a, 0x35, 0x38, 0x3a, 0x31,
++	0x35, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++	0x40, 0xe8, 0x1a, 0x08, 0x78, 0xb8, 0xda, 0xff, 0xeb, 0x75, 0x05, 0x08, 0x00, 0xf0, 0x1a, 0x08,
++	0x31, 0x2e, 0x30, 0x30, 0x2e, 0x30, 0x33, 0x00, 0x84, 0xb8, 0xda, 0xff, 0x51, 0x61, 0x05, 0x08,
++	0xc0, 0x07, 0x00, 0x00, 0xf0, 0xb8, 0xda, 0xff, 0x33, 0x37, 0x05, 0x08, 0xc0, 0x07, 0x00, 0x00,
++	0x4e, 0x57, 0x41, 0x35, 0x31, 0x32, 0x33, 0x2d, 0x41, 0x43, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x28, 0x00, 0x00, 0x00, 0xa0, 0x4e, 0x0b, 0x08,
++	0x08, 0x0b, 0x4a, 0xec, 0x21, 0xe6, 0x54, 0xce, 0x5d, 0xdd, 0x7e, 0x86, 0x98, 0x38, 0xc0, 0xd0,
++	0x00, 0x05, 0x26, 0xe1, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00,
++	0xec, 0x4a, 0x0b, 0x08, 0x79, 0x17, 0x02, 0x00, 0x70, 0xd8, 0x18, 0x08, 0x04, 0x00, 0x00, 0x00,
++	0x18, 0x00, 0x00, 0x00, 0xa0, 0x4a, 0x0b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00,
++	0x0c, 0xb9, 0xda, 0xff, 0xa2, 0x47, 0x05, 0x08, 0xa0, 0x4a, 0x0b, 0x08, 0x00, 0x00, 0x00, 0x00,
++	0x20, 0x00, 0x00, 0x00, 0xa0, 0x4e, 0x0b, 0x08, 0xec, 0x4a, 0x0b, 0x08, 0x24, 0xb9, 0xda, 0xff,
++	0xa4, 0x82, 0x05, 0x08, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x98, 0x02, 0x00, 0x00,
++	0xa0, 0x4e, 0x0b, 0x08, 0xec, 0x4a, 0x0b, 0x08, 0x35, 0x50, 0x05, 0x08, 0x69, 0x17, 0x02, 0x00,
++	0x88, 0xd8, 0x18, 0x08, 0x03, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0xa0, 0x4a, 0x0b, 0x08,
++	0x00, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x00, 0x00, 0xe1, 0x14, 0x02, 0x00, 0x98, 0xd8, 0x18, 0x08,
++	0x43, 0x00, 0x00, 0x00, 0x88, 0x02, 0x00, 0x00, 0xa0, 0x4a, 0x0b, 0x08, 0x00, 0x00, 0x00, 0x00,
++	0x80, 0x02, 0x00, 0x00, 0x80, 0xb9, 0xda, 0xff, 0xa2, 0x47, 0x05, 0x08, 0xa0, 0x4a, 0x0b, 0x08,
++	0x80, 0x02, 0x00, 0x00, 0x90, 0xd8, 0x5f, 0x3d, 0x67, 0x3c, 0xdb, 0xff, 0x60, 0xc5, 0xda, 0xff,
++	0xf2, 0xcd, 0x09, 0x08, 0xac, 0xb9, 0xda, 0xff, 0x68, 0x75, 0x06, 0x08, 0x69, 0x3c, 0xdb, 0xff,
++	0xf2, 0xcd, 0x09, 0x08, 0x0e, 0x00, 0x00, 0x00, 0x4c, 0x44, 0x00, 0x00, 0x0e, 0x00, 0x00, 0x00,
++	0x44, 0xbc, 0xda, 0xff, 0x34, 0xbc, 0xda, 0xff, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01, 0xc2, 0x00,
++};
++
++static const char *progname;
++
++static uint32_t md5ws(const void *data, size_t len)
++{
++	MD5_CTX ctx;
++	uint8_t digest[16];
++	uint32_t w[4], sum;
++	int i;
++
++	MD5_Init(&ctx);
++	MD5_Update(&ctx, data, len);
++	MD5_Final(digest, &ctx);
++
++	for (i = 0; i < 4; i++)
++		w[i] = ((uint32_t)digest[i * 4] << 24) |
++		       ((uint32_t)digest[i * 4 + 1] << 16) |
++		       ((uint32_t)digest[i * 4 + 2] << 8) |
++		       ((uint32_t)digest[i * 4 + 3]);
++
++	sum = (w[0] + w[1] + w[2] + w[3]) & 0xFFFFFFFF;
++	return sum ? sum : 1;
++}
++
++static void *map_file(const char *path, size_t *size)
++{
++	struct stat st;
++	FILE *fp;
++	void *buf;
++
++	if (stat(path, &st)) {
++		fprintf(stderr, "%s: stat %s: %s\n", progname, path,
++			strerror(errno));
++		return NULL;
++	}
++	*size = st.st_size;
++
++	buf = malloc(*size);
++	if (!buf) {
++		fprintf(stderr, "%s: malloc(%zu): %s\n", progname, *size,
++			strerror(errno));
++		return NULL;
++	}
++
++	fp = fopen(path, "rb");
++	if (!fp) {
++		fprintf(stderr, "%s: open %s: %s\n", progname, path,
++			strerror(errno));
++		free(buf);
++		return NULL;
++	}
++
++	if (fread(buf, 1, *size, fp) != *size) {
++		fprintf(stderr, "%s: short read on %s\n", progname, path);
++		fclose(fp);
++		free(buf);
++		return NULL;
++	}
++
++	fclose(fp);
++	return buf;
++}
++
++static void usage(int status)
++{
++	fprintf(stderr,
++		"Usage: %s [OPTIONS]\n"
++		"  -B <board>      board name (required)\n"
++		"  -k <file>       kernel image (required)\n"
++		"  -r <file>       rootfs image (required)\n"
++		"  -o <file>       output file (required)\n"
++		"  -v <version>    firmware version (default: 1.00.00)\n"
++		"  -K <offset>     kernel flash offset (default: 0x%x)\n"
++		"  -R <offset>     rootfs flash offset (default: 0x%x)\n"
++		"  -m <model_id>   model ID (default: 0)\n"
++		"  -V <version>    kernel version string for ATDS\n"
++		"  -Z <version>    ZLD version string for ATDS\n"
++		"  -d <date>       build date string (YYYY-MM-DD HH:MM:SS)\n"
++		"  -h              show this help\n",
++		progname, DEFAULT_KERNEL_OFFSET, DEFAULT_ROOTFS_OFFSET);
++	exit(status);
++}
++
++int main(int argc, char *argv[])
++{
++	struct deadbeaf_header hdr;
++	struct section_entry s0, s1;
++	const char *board = NULL, *kernel_path = NULL;
++	const char *rootfs_path = NULL, *output_path = NULL;
++	const char *version = "1.00.00";
++	const char *kernel_version = "0.0.0";
++	const char *zld_version = "0.00(XXXX.0)";
++	const char *build_date = "2000-01-01 00:00:00";
++	uint32_t kernel_offset = DEFAULT_KERNEL_OFFSET;
++	uint32_t rootfs_offset = DEFAULT_ROOTFS_OFFSET;
++	uint32_t model_id = DEFAULT_MODEL_ID;
++	uint32_t s0_checksum, s1_checksum, master_crc;
++	void *kernel_data, *rootfs_data, *file_buf;
++	size_t kernel_size, rootfs_size, file_size;
++	char name_buf[FILENAME_LEN];
++	FILE *fp;
++	int opt, i;
++
++	progname = argv[0];
++
++	while ((opt = getopt(argc, argv, "B:k:r:o:v:K:R:m:V:Z:d:h")) != -1) {
++		switch (opt) {
++		case 'B': board = optarg; break;
++		case 'k': kernel_path = optarg; break;
++		case 'r': rootfs_path = optarg; break;
++		case 'o': output_path = optarg; break;
++		case 'v': version = optarg; break;
++		case 'K': kernel_offset = strtoul(optarg, NULL, 0); break;
++		case 'R': rootfs_offset = strtoul(optarg, NULL, 0); break;
++		case 'm': model_id = strtoul(optarg, NULL, 0); break;
++		case 'V': kernel_version = optarg; break;
++		case 'Z': zld_version = optarg; break;
++		case 'd': build_date = optarg; break;
++		case 'h': usage(0);
++		default:  usage(1);
++		}
++	}
++
++	if (!board || !kernel_path || !rootfs_path || !output_path) {
++		fprintf(stderr, "%s: missing required arguments\n", progname);
++		usage(1);
++	}
++
++	kernel_data = map_file(kernel_path, &kernel_size);
++	if (!kernel_data)
++		return 1;
++
++	rootfs_data = map_file(rootfs_path, &rootfs_size);
++	if (!rootfs_data)
++		return 1;
++
++	/*
++	 * Section 0 (kernel) data on flash: [sub_hdr 512][kernel ...]
++	 * Section 1 (rootfs) data on flash: rootfs as-is
++	 */
++	uint32_t s0_data_size = SUB_HDR_SIZE + kernel_size;
++	file_size = KERNEL_DATA_OFFSET + kernel_size + rootfs_size;
++
++	/* Checksums over actual on-flash content */
++	s0_checksum = md5ws(kernel_data, kernel_size);
++	s1_checksum = md5ws(rootfs_data, rootfs_size);
++
++	/* Build pre-header */
++	memset(&hdr, 0, sizeof(hdr));
++	hdr.magic           = cpu_to_be32(DEADBEAF_MAGIC);
++	hdr.type            = cpu_to_be32(0x01000002);
++	hdr.model_id        = cpu_to_be32(model_id);
++	hdr.reserved1       = cpu_to_be32(0xFFFFFFFF);
++	hdr.reserved2       = cpu_to_be32(0xFFFFFFFF);
++	hdr.file_size       = cpu_to_be32(file_size);
++	hdr.header_size     = cpu_to_be16(HEADER_SIZE);
++	hdr.pre_header_size = cpu_to_be16(PRE_HEADER_SIZE);
++	hdr.flags           = cpu_to_be32(0x01100000);
++	strncpy(hdr.version, version, sizeof(hdr.version) - 1);
++	strncpy(hdr.board, board, sizeof(hdr.board) - 1);
++	hdr.num_sections    = cpu_to_be16(2);
++
++	/* Build section 0 (kernel) entry */
++	memset(&s0, 0, sizeof(s0));
++	s0.size         = cpu_to_be32(s0_data_size);
++	s0.checksum     = cpu_to_be32(s0_checksum);
++	s0.flash_offset = cpu_to_be32(kernel_offset);
++
++	memset(name_buf, 0, sizeof(name_buf));
++	snprintf(name_buf, sizeof(name_buf), "kernel");
++	i = (int)strlen(name_buf);
++	strncpy(name_buf + i, board, sizeof(name_buf) - i - 5);
++	for (; name_buf[i]; i++)
++		if (name_buf[i] >= 'A' && name_buf[i] <= 'Z')
++			name_buf[i] += 'a' - 'A';
++	strncat(name_buf, ".bin", sizeof(name_buf) - strlen(name_buf) - 1);
++	strncpy(s0.filename, name_buf, FILENAME_LEN - 1);
++	strncpy(s0.partition, "kernel", PARTITION_LEN - 1);
++	strncpy(s0.version, kernel_version, VERSION_LEN - 1);
++	strncpy(s0.date, build_date, DATE_LEN - 1);
++	s0.trailer = cpu_to_be32(kernel_offset);
++
++	/* Build section 1 (rootfs) entry */
++	memset(&s1, 0, sizeof(s1));
++	s1.size         = cpu_to_be32(rootfs_size);
++	s1.checksum     = cpu_to_be32(s1_checksum);
++	s1.flash_offset = cpu_to_be32(rootfs_offset);
++	strncpy(s1.filename, "squashfs_ro.img", FILENAME_LEN - 1);
++	strncpy(s1.partition, "zldfs", PARTITION_LEN - 1);
++	strncpy(s1.version, zld_version, VERSION_LEN - 1);
++	strncpy(s1.date, build_date, DATE_LEN - 1);
++
++	/* Assemble file buffer */
++	file_buf = calloc(1, file_size);
++	if (!file_buf) {
++		fprintf(stderr, "%s: calloc(%zu) failed\n", progname, file_size);
++		return 1;
++	}
++
++	memcpy(file_buf, &hdr, sizeof(hdr));
++	memcpy((uint8_t *)file_buf + PRE_HEADER_SIZE, &s0, sizeof(s0));
++	memcpy((uint8_t *)file_buf + PRE_HEADER_SIZE + SECTION_ENTRY_SIZE,
++	       &s1, sizeof(s1));
++
++	/*
++	 * Place sub-header (overlaps last 4 bytes of s1 entry's trailer).
++	 * This matches stock Zyxel firmware's layout.
++	 */
++	memcpy((uint8_t *)file_buf + SUB_HDR_OFFSET,
++	       subhdr_template, SUB_HDR_SIZE);
++
++	/* Kernel data follows sub-header */
++	memcpy((uint8_t *)file_buf + KERNEL_DATA_OFFSET,
++	       kernel_data, kernel_size);
++
++	/* Rootfs data follows kernel */
++	memcpy((uint8_t *)file_buf + KERNEL_DATA_OFFSET + kernel_size,
++	       rootfs_data, rootfs_size);
++
++	/* Patch sub-header checksum slots that depend on this build */
++	{
++		uint32_t be_s0 = cpu_to_be32(s0_checksum);
++		uint32_t be_s1 = cpu_to_be32(s1_checksum);
++		uint32_t be_mid = cpu_to_be32(model_id);
++		uint8_t *s = (uint8_t *)file_buf + SUB_HDR_OFFSET;
++		memcpy(s + SUBHDR_OFF_S0_CHECKSUM, &be_s0, 4);
++		memcpy(s + SUBHDR_OFF_S1_CHECKSUM, &be_s1, 4);
++		memcpy(s + SUBHDR_OFF_MODEL_ID, &be_mid, 4);
++	}
++
++	/*
++	 * Patch sub-header text fields so ZLD displays them in ATDS and marks
++	 * the image as "Success" instead of "Fail". Observed from stock Zyxel
++	 * sub_hdr on nor0:0x30000 after a factory flash:
++	 *   0x1D-0x21: "ldfs" filesystem type marker (required for Success)
++	 *   0x40-0x5F: kernel version "VERSION | BUILD_DATE"
++	 *   0x80-0xA1: ZLD version "VERSION | BUILD_DATE"
++	 * ZLD overwrites 0x00-0x1C (bootbase version), 0xC0 (hw version from
++	 * hdr.version), 0xE0 (model from hdr.board) and the checksum/model_id
++	 * slots during flash; the fields written here are preserved.
++	 */
++	{
++		uint8_t *s = (uint8_t *)file_buf + SUB_HDR_OFFSET;
++		memcpy(s + 0x1D, "ldfs", 4);
++		s[0x21] = 0;
++		snprintf((char *)(s + 0x40), 0x60 - 0x40, "%s | %s",
++			 kernel_version, build_date);
++		snprintf((char *)(s + 0x80), 0xC0 - 0x80, "%s | %s",
++			 zld_version, build_date);
++	}
++
++	/*
++	 * Master checksum: md5ws over file[4:] with the 512 bytes of
++	 * sub-header temporarily zeroed. ZLD computes it the same way.
++	 */
++	{
++		uint8_t saved[SUB_HDR_SIZE];
++		memcpy(saved, (uint8_t *)file_buf + SUB_HDR_OFFSET, SUB_HDR_SIZE);
++		memset((uint8_t *)file_buf + SUB_HDR_OFFSET, 0, SUB_HDR_SIZE);
++		master_crc = md5ws((uint8_t *)file_buf + 4, file_size - 4);
++		memcpy((uint8_t *)file_buf + SUB_HDR_OFFSET, saved, SUB_HDR_SIZE);
++	}
++
++	/* Store master_crc both at file[0:4] and inside sub-header at offset 264 */
++	{
++		uint32_t be_mcrc = cpu_to_be32(master_crc);
++		memcpy((uint8_t *)file_buf, &be_mcrc, 4);
++		memcpy((uint8_t *)file_buf + SUB_HDR_OFFSET + SUBHDR_OFF_MASTER_CRC,
++		       &be_mcrc, 4);
++	}
++
++	/* Write output */
++	fp = fopen(output_path, "wb");
++	if (!fp) {
++		fprintf(stderr, "%s: open %s: %s\n", progname, output_path,
++			strerror(errno));
++		return 1;
++	}
++
++	if (fwrite(file_buf, 1, file_size, fp) != file_size) {
++		fprintf(stderr, "%s: write error\n", progname);
++		fclose(fp);
++		return 1;
++	}
++
++	fclose(fp);
++	free(file_buf);
++	free(kernel_data);
++	free(rootfs_data);
++
++	fprintf(stderr,
++		"%s: %s kernel=%zu rootfs=%zu total=%zu "
++		"kernel_off=0x%x rootfs_off=0x%x master_crc=0x%08x\n",
++		progname, board, kernel_size, rootfs_size, file_size,
++		kernel_offset, rootfs_offset, master_crc);
++
++	return 0;
++}
