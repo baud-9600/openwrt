@@ -1,1106 +1,417 @@
-From c4acc617167c2316b657b8ee0b71ef2823f8a87e Mon Sep 17 00:00:00 2001
+From dc6e2ca2fae29b0c0e76659deb30f54be07a7e88 Mon Sep 17 00:00:00 2001
 From: Manuel Kuklinski <mk@asdfghasdfgh.de>
-Date: Thu, 29 Oct 2026 15:13:01 +0000
-Subject: [PATCH 4/7] ath79: add Zyxel NWA5123-AC support
+Date: Sat, 7 Nov 2026 09:04:21 +0100
+Subject: [PATCH 4/4] ath79: add Zyxel NWA5123-AC support
 
-Add device definition and factory image support for the Zyxel
-NWA5123-AC enterprise access point.
+Add the zyxel-deadbeaf builders and the NWA5123-AC device definition.
+ZLD only writes section data to flash, so section 0 carries the OKLI
+loader stub in the kernel partition and section 1 carries the OKLI
+kernel plus squashfs rootfs in the zldfs partition, padded with 0xFF
+to the full partition size so the jffs2 overlay starts clean.
 
-- Add Build/zyxel-deadbeaf recipe using mkdeadbeaf to create
-  factory images in Zyxel's proprietary "deadbeaf" format,
-  flashable via the stock web UI
-- Add NWA5123-AC device definition with LOADER_FLASH_BASE=0x1e000000
-  (CS1) and LOADER_FLASH_OFFS=0x180000
-- Include mkdeadbeaf.c source (to be submitted to firmware-utils repo)
-- Include generated patch files for reference
-
-Note: mkdeadbeaf.c needs to be submitted separately to the
-openwrt/firmware-utils repository with a CMakeLists.txt entry:
-  FW_UTIL(mkdeadbeaf src/md5.c "" "")
-
+The loader probes the CS0 image slot first and falls back to reading
+CS1 via SPI at the zldfs offset. Add a first-boot script that mirrors
+the OKLI stub into both Zyxel image slots so ZLD boots OpenWrt
+regardless of its persistent bootImage flag, and document the flash
+layout, boot flow, installation, recovery, Ethernet tuning, mesh and
+802.11r setup.
 ---
- ...loader-add-CONFIG_FLASH_BASE-support.patch |  67 ++++
- ...ass-LOADER_FLASH_BASE-to-lzma-loader.patch |  34 ++
- ...3-ath79-add-Zyxel-NWA5123-AC-support.patch |  49 +++
- .../0004-ath79-dts-add-Zyxel-NWA5123-AC.patch | 223 ++++++++++++
- ...-add-mkdeadbeaf-for-Zyxel-NWA5123-AC.patch | 332 ++++++++++++++++++
- scripts/mkdeadbeaf.c                          | 321 +++++++++++++++++
- target/linux/ath79/image/generic.mk           |  26 ++
- 7 files changed, 1052 insertions(+)
- create mode 100644 patches/0001-ath79-lzma-loader-add-CONFIG_FLASH_BASE-support.patch
- create mode 100644 patches/0002-ath79-image-pass-LOADER_FLASH_BASE-to-lzma-loader.patch
- create mode 100644 patches/0003-ath79-add-Zyxel-NWA5123-AC-support.patch
- create mode 100644 patches/0004-ath79-dts-add-Zyxel-NWA5123-AC.patch
- create mode 100644 patches/0005-firmware-utils-add-mkdeadbeaf-for-Zyxel-NWA5123-AC.patch
- create mode 100644 scripts/mkdeadbeaf.c
+ .../99_zyxel-nwa5123-ac-slot-mirror           | 115 ++++++++
+ .../ath79/image/README-zyxel-nwa5123-ac.md    | 248 ++++++++++++++++++
+ target/linux/ath79/image/generic.mk           | 123 +++++++++
+ 3 files changed, 486 insertions(+)
+ create mode 100755 target/linux/ath79/generic/base-files/etc/uci-defaults/99_zyxel-nwa5123-ac-slot-mirror
+ create mode 100644 target/linux/ath79/image/README-zyxel-nwa5123-ac.md
 
-diff --git a/patches/0001-ath79-lzma-loader-add-CONFIG_FLASH_BASE-support.patch b/patches/0001-ath79-lzma-loader-add-CONFIG_FLASH_BASE-support.patch
-new file mode 100644
-index 0000000..cf8ebaf
+diff --git a/target/linux/ath79/generic/base-files/etc/uci-defaults/99_zyxel-nwa5123-ac-slot-mirror b/target/linux/ath79/generic/base-files/etc/uci-defaults/99_zyxel-nwa5123-ac-slot-mirror
+new file mode 100755
+index 0000000000..3125a791e9
 --- /dev/null
-+++ b/patches/0001-ath79-lzma-loader-add-CONFIG_FLASH_BASE-support.patch
-@@ -0,0 +1,67 @@
-+From: OpenWrt <noreply@openwrt.org>
-+Subject: [PATCH] ath79: ath79 lzma loader add CONFIG_FLASH_BASE support
++++ b/target/linux/ath79/generic/base-files/etc/uci-defaults/99_zyxel-nwa5123-ac-slot-mirror
+@@ -0,0 +1,115 @@
++#!/bin/sh
++#
++# One-shot: mirror the OKLI loader uImage into BOTH Zyxel image slots
++# (zy-image0 on CS0, zy-image1-loader on CS1) so that ZLD boots our
++# OKLI stub no matter which slot it picks on the next power-on.
++#
++# Why both slots?
++#   Zyxel ships NWA5123-AC units with the ex-factory bootImage flag at
++#   either 0 or 1. ATNZ writes the inactive slot, so:
++#     bootImage=0 unit -> OpenWrt lands on CS1 (zy-image1-loader),
++#                         CS0 (zy-image0) stays stock Zyxel
++#     bootImage=1 unit -> OpenWrt lands on CS0 (zy-image0),
++#                         CS1 (zy-image1-loader) stays stock Zyxel
++#   ZLD's auto-boot preference is sticky and bootbase's ATxx commands
++#   for flipping it are inaccessible on this device, so we can't force
++#   ZLD to boot our newly-flashed slot. The workaround is to put the
++#   OKLI stub into the OTHER slot too; the universal OKLI loader
++#   (LOADER_FLASH_CS0_FALLBACK) finds the real kernel+rootfs on
++#   whichever flash chip ZLD actually programmed.
++#
++# Idempotent: skips the write if the destination slot already carries
++# the OKLI stub, so re-running after sysupgrade/factory doesn't wear
++# the flash. Preserves everything in the destination slot beyond the
++# first 1152k (= the kernel partition) so the recovery recipe can
++# still rebuild a bootable Zyxel image from a stock dump.
 +
-+---
-+diff --git a/target/linux/ath79/image/lzma-loader/Makefile b/target/linux/ath79/image/lzma-loader/Makefile
-+index 2b1ed82..1b001e4 100644
-+--- a/target/linux/ath79/image/lzma-loader/Makefile
-++++ b/target/linux/ath79/image/lzma-loader/Makefile
-+@@ -17,6 +17,7 @@ KERNEL_MAGIC	:=
-+ TARGET_DIR	:=
-+ FLASH_OFFS	:=
-+ FLASH_MAX	:=
-++FLASH_BASE	:=
-+ BOARD		:=
-+ 
-+ ifeq ($(TARGET_DIR),)
-+@@ -45,6 +46,7 @@ loader-compile: $(PKG_BUILD_DIR)/.prepared
-+ 		KERNEL_MAGIC=$(KERNEL_MAGIC) \
-+ 		FLASH_OFFS=$(FLASH_OFFS) \
-+ 		FLASH_MAX=$(FLASH_MAX) \
-++		FLASH_BASE=$(FLASH_BASE) \
-+ 		BOARD="$(BOARD)" \
-+ 		clean all
-+ 
-+diff --git a/target/linux/ath79/image/lzma-loader/src/Makefile b/target/linux/ath79/image/lzma-loader/src/Makefile
-+index c7bb935..7f9e621 100644
-+--- a/target/linux/ath79/image/lzma-loader/src/Makefile
-++++ b/target/linux/ath79/image/lzma-loader/src/Makefile
-+@@ -22,6 +22,7 @@ KERNEL_MAGIC	:=
-+ BOARD		:=
-+ FLASH_OFFS	:=
-+ FLASH_MAX	:=
-++FLASH_BASE	:=
-+ 
-+ CC		:= $(CROSS_COMPILE)gcc
-+ LD		:= $(CROSS_COMPILE)ld
-+@@ -71,6 +72,10 @@ ifneq ($(strip $(FLASH_MAX)),)
-+ CFLAGS		+= -DCONFIG_FLASH_MAX=$(FLASH_MAX)
-+ endif
-+ 
-++ifneq ($(strip $(FLASH_BASE)),)
-++CFLAGS		+= -DCONFIG_FLASH_BASE=$(FLASH_BASE)
-++endif
-++
-+ BOARD_DEF := $(shell echo $(strip $(BOARD)) | tr a-z A-Z | tr - _)
-+ ifneq ($(BOARD_DEF),)
-+ CFLAGS		+= -DCONFIG_BOARD_$(BOARD_DEF)
-+diff --git a/target/linux/ath79/image/lzma-loader/src/loader.c b/target/linux/ath79/image/lzma-loader/src/loader.c
-+index 0213e94..96c9469 100644
-+--- a/target/linux/ath79/image/lzma-loader/src/loader.c
-++++ b/target/linux/ath79/image/lzma-loader/src/loader.c
-+@@ -27,8 +27,12 @@
-+ #include "printf.h"
-+ #include "LzmaDecode.h"
-+ 
-+-#define AR71XX_FLASH_START	0x1f000000
-+-#define AR71XX_FLASH_END	0x1fe00000
-++#ifndef CONFIG_FLASH_BASE
-++#define CONFIG_FLASH_BASE	0x1f000000
-++#endif
-++
-++#define AR71XX_FLASH_START	CONFIG_FLASH_BASE
-++#define AR71XX_FLASH_END	(CONFIG_FLASH_BASE + 0x00e00000)
-+ 
-+ #define KSEG0			0x80000000
-+ #define KSEG1			0xa0000000
-+-- 
-diff --git a/patches/0002-ath79-image-pass-LOADER_FLASH_BASE-to-lzma-loader.patch b/patches/0002-ath79-image-pass-LOADER_FLASH_BASE-to-lzma-loader.patch
-new file mode 100644
-index 0000000..594b3dd
---- /dev/null
-+++ b/patches/0002-ath79-image-pass-LOADER_FLASH_BASE-to-lzma-loader.patch
-@@ -0,0 +1,34 @@
-+From: OpenWrt <noreply@openwrt.org>
-+Subject: [PATCH] ath79: ath79 image pass LOADER_FLASH_BASE to lzma loader
++. /lib/functions.sh
 +
-+---
-+diff --git a/target/linux/ath79/image/Makefile b/target/linux/ath79/image/Makefile
-+index 572da8c..2786135 100644
-+--- a/target/linux/ath79/image/Makefile
-++++ b/target/linux/ath79/image/Makefile
-+@@ -3,7 +3,7 @@ include $(INCLUDE_DIR)/image.mk
-+ 
-+ KERNEL_LOADADDR = 0x80060000
-+ 
-+-DEVICE_VARS += LOADER_FLASH_OFFS LOADER_TYPE
-++DEVICE_VARS += LOADER_FLASH_OFFS LOADER_FLASH_BASE LOADER_TYPE
-+ DEVICE_VARS += LOADER_FLASH_MAX LOADER_KERNEL_MAGIC LZMA_TEXT_START
-+ DEVICE_VARS += NETGEAR_BOARD_ID NETGEAR_HW_ID
-+ DEVICE_VARS += RAS_BOARD RAS_ROOTFS_SIZE RAS_VERSION
-+@@ -30,6 +30,7 @@ define Build/loader-okli-compile
-+ 	$(call Build/loader-common, \
-+ 		FLASH_OFFS=$(LOADER_FLASH_OFFS) \
-+ 		FLASH_MAX=$(LOADER_FLASH_MAX) \
-++		FLASH_BASE=$(LOADER_FLASH_BASE) \
-+ 		KERNEL_MAGIC=$(LOADER_KERNEL_MAGIC) \
-+ 		BOARD="$(DEVICE_NAME)" )
-+ endef
-+@@ -78,6 +79,7 @@ endif
-+   LOADER_KERNEL_MAGIC :=
-+   LOADER_FLASH_MAX :=
-+   LOADER_FLASH_OFFS :=
-++  LOADER_FLASH_BASE :=
-+   LOADER_TYPE :=
-+   LZMA_TEXT_START := 0x81800000
-+   COMPILE :=
-+-- 
-diff --git a/patches/0003-ath79-add-Zyxel-NWA5123-AC-support.patch b/patches/0003-ath79-add-Zyxel-NWA5123-AC-support.patch
-new file mode 100644
-index 0000000..e19a625
---- /dev/null
-+++ b/patches/0003-ath79-add-Zyxel-NWA5123-AC-support.patch
-@@ -0,0 +1,49 @@
-+From: OpenWrt <noreply@openwrt.org>
-+Subject: [PATCH] ath79: ath79 add Zyxel NWA5123 AC support
++board=$(board_name)
++[ "$board" = "zyxel,nwa5123-ac" ] || exit 0
 +
-+---
-+diff --git a/target/linux/ath79/image/generic.mk b/target/linux/ath79/image/generic.mk
-+index ef156dd..409e4ec 100644
-+--- a/target/linux/ath79/image/generic.mk
-++++ b/target/linux/ath79/image/generic.mk
-+@@ -169,6 +169,15 @@ define Build/zyxel-tar-bz2
-+ 	rm -rf $@.tmp
-+ endef
-+ 
-++define Build/zyxel-deadbeaf
-++	$(STAGING_DIR_HOST)/bin/mkdeadbeaf \
-++		-B $(1) \
-++		-k $(IMAGE_KERNEL) \
-++		-r $@ \
-++		-o $@.new
-++	mv $@.new $@
-++endef
-++
-+ 
-+ define Device/8dev_carambola2
-+   SOC := ar9331
-+@@ -3464,6 +3473,23 @@ define Device/zyxel_nwa1123-ni
-+ endef
-+ TARGET_DEVICES += zyxel_nwa1123-ni
-+ 
-++define Device/zyxel_nwa5123-ac
-++  $(Device/loader-okli-uimage)
-++  SOC := ar9344
-++  DEVICE_VENDOR := Zyxel
-++  DEVICE_MODEL := NWA5123-AC
-++  DEVICE_PACKAGES := kmod-ath10k-ct-smallbuffers \
-++	ath10k-firmware-qca988x-ct
-++  LOADER_FLASH_OFFS := 0x180000
-++  LOADER_FLASH_BASE := 0x1e000000
-++  KERNEL := kernel-bin | append-dtb | lzma | uImage lzma -M 0x4f4b4c49
-++  IMAGE_SIZE := 14848k
-++  IMAGES += factory.bin
-++  IMAGE/factory.bin := append-kernel | pad-to $$$$(BLOCKSIZE) | \
-++	append-rootfs | pad-rootfs | check-size | zyxel-deadbeaf NWA5123-AC
-++endef
-++TARGET_DEVICES += zyxel_nwa5123-ac
-++
-+ define Device/zyxel_nbg6616
-+   SOC := qca9557
-+   DEVICE_VENDOR := Zyxel
-+-- 
-diff --git a/patches/0004-ath79-dts-add-Zyxel-NWA5123-AC.patch b/patches/0004-ath79-dts-add-Zyxel-NWA5123-AC.patch
-new file mode 100644
-index 0000000..b63ce79
---- /dev/null
-+++ b/patches/0004-ath79-dts-add-Zyxel-NWA5123-AC.patch
-@@ -0,0 +1,223 @@
-+From: OpenWrt <noreply@openwrt.org>
-+Subject: [PATCH] ath79: ath79 dts add Zyxel NWA5123 AC
++OKLI_MAGIC=4f4b4c49    # 'OKLI' at offset 0 of the firmware partition
 +
-+---
-+diff --git a/target/linux/ath79/dts/ar9344_zyxel_nwa5123-ac.dts b/target/linux/ath79/dts/ar9344_zyxel_nwa5123-ac.dts
-+new file mode 100644
-+index 0000000..6ca52c6
-+--- /dev/null
-++++ b/target/linux/ath79/dts/ar9344_zyxel_nwa5123-ac.dts
-+@@ -0,0 +1,212 @@
-++// SPDX-License-Identifier: GPL-2.0-or-later OR MIT
-++
-++#include "ar9344.dtsi"
-++
-++#include <dt-bindings/gpio/gpio.h>
-++#include <dt-bindings/input/input.h>
-++#include <dt-bindings/leds/common.h>
-++#include <dt-bindings/mtd/partitions/uimage.h>
-++
-++/ {
-++	model = "Zyxel NWA5123-AC";
-++	compatible = "zyxel,nwa5123-ac", "qca,ar9344";
-++
-++	aliases {
-++		label-mac-device = &eth0;
-++		led-boot = &led_status_green;
-++		led-failsafe = &led_status_amber;
-++		led-running = &led_status_green;
-++		led-upgrade = &led_status_amber;
-++	};
-++
-++	leds {
-++		compatible = "gpio-leds";
-++
-++		led_status_green: status_green {
-++			function = LED_FUNCTION_STATUS;
-++			color = <LED_COLOR_ID_GREEN>;
-++			gpios = <&gpio 12 GPIO_ACTIVE_LOW>;
-++			default-state = "on";
-++		};
-++
-++		led_status_amber: status_amber {
-++			function = LED_FUNCTION_STATUS;
-++			color = <LED_COLOR_ID_AMBER>;
-++			gpios = <&gpio 11 GPIO_ACTIVE_LOW>;
-++		};
-++	};
-++
-++	keys {
-++		compatible = "gpio-keys";
-++
-++		reset {
-++			label = "reset";
-++			linux,code = <KEY_RESTART>;
-++			gpios = <&gpio 4 GPIO_ACTIVE_LOW>;
-++		};
-++	};
-++};
-++
-++&ref {
-++	clock-frequency = <40000000>;
-++};
-++
-++&spi {
-++	status = "okay";
-++
-++	/* CS0: boot flash */
-++	flash@0 {
-++		compatible = "jedec,spi-nor";
-++		reg = <0>;
-++		spi-max-frequency = <50000000>;
-++
-++		partitions {
-++			compatible = "fixed-partitions";
-++			#address-cells = <1>;
-++			#size-cells = <1>;
-++
-++			partition@0 {
-++				label = "u-boot";
-++				reg = <0x000000 0x040000>;
-++				read-only;
-++			};
-++
-++			partition@40000 {
-++				label = "u-boot-env";
-++				reg = <0x040000 0x010000>;
-++			};
-++
-++			partition@50000 {
-++				label = "loader";
-++				reg = <0x050000 0x010000>;
-++				read-only;
-++			};
-++
-++			partition@fa0000 {
-++				label = "config";
-++				reg = <0xfa0000 0x040000>;
-++				read-only;
-++			};
-++
-++			partition@fe0000 {
-++				label = "mib0";
-++				reg = <0xfe0000 0x010000>;
-++				read-only;
-++
-++				nvmem-layout {
-++					compatible = "fixed-layout";
-++					#address-cells = <1>;
-++					#size-cells = <1>;
-++
-++					macaddr_mib0_4b: macaddr@4b {
-++						compatible = "mac-base";
-++						reg = <0x4b 0x11>;
-++						#nvmem-cell-cells = <1>;
-++					};
-++
-++					macaddr_mib0_66: macaddr@66 {
-++						compatible = "mac-base";
-++						reg = <0x66 0x11>;
-++						#nvmem-cell-cells = <1>;
-++					};
-++				};
-++			};
-++
-++			partition@ff0000 {
-++				label = "art";
-++				reg = <0xff0000 0x010000>;
-++				read-only;
-++
-++				nvmem-layout {
-++					compatible = "fixed-layout";
-++					#address-cells = <1>;
-++					#size-cells = <1>;
-++
-++					calibration_ath9k: calibration@1000 {
-++						reg = <0x1000 0x440>;
-++					};
-++
-++					macaddr_art_1002: macaddr@1002 {
-++						reg = <0x1002 0x6>;
-++					};
-++				};
-++			};
-++		};
-++	};
-++
-++	/* CS1: firmware flash */
-++	flash@1 {
-++		compatible = "jedec,spi-nor";
-++		reg = <1>;
-++		spi-max-frequency = <50000000>;
-++
-++		partitions {
-++			compatible = "fixed-partitions";
-++			#address-cells = <1>;
-++			#size-cells = <1>;
-++
-++			partition@0 {
-++				label = "reserve";
-++				reg = <0x000000 0x180000>;
-++				read-only;
-++			};
-++
-++			partition@180000 {
-++				compatible = "openwrt,uimage", "denx,uimage";
-++				openwrt,ih-magic = <IH_MAGIC_OKLI>;
-++				label = "firmware";
-++				reg = <0x180000 0xe80000>;
-++			};
-++		};
-++	};
-++};
-++
-++&pcie {
-++	status = "okay";
-++
-++	wifi@0,0 {
-++		compatible = "qcom,ath10k";
-++		reg = <0x0000 0 0 0 0>;
-++		nvmem-cells = <&macaddr_mib0_66 0>;
-++		nvmem-cell-names = "mac-address";
-++	};
-++};
-++
-++&mdio0 {
-++	status = "okay";
-++
-++	phy0: ethernet-phy@0 {
-++		reg = <0>;
-++		phy-mode = "rgmii";
-++	};
-++};
-++
-++&eth0 {
-++	status = "okay";
-++
-++	pll-data = <0x06000000 0x00000101 0x00001313>;
-++
-++	nvmem-cells = <&macaddr_art_1002>;
-++	nvmem-cell-names = "mac-address";
-++
-++	phy-mode = "rgmii-id";
-++	phy-handle = <&phy0>;
-++
-++	gmac-config {
-++		device = <&gmac>;
-++		rxdv-delay = <3>;
-++		rxd-delay = <3>;
-++		txen-delay = <3>;
-++		txd-delay = <3>;
-++		rgmii-gmac0 = <1>;
-++	};
-++};
-++
-++&wmac {
-++	status = "okay";
-++
-++	ieee80211-freq-limit = <2402000 2482000>;
-++
-++	nvmem-cells = <&macaddr_mib0_4b 0>, <&calibration_ath9k>;
-++	nvmem-cell-names = "mac-address", "calibration";
-++};
-+-- 
-diff --git a/patches/0005-firmware-utils-add-mkdeadbeaf-for-Zyxel-NWA5123-AC.patch b/patches/0005-firmware-utils-add-mkdeadbeaf-for-Zyxel-NWA5123-AC.patch
-new file mode 100644
-index 0000000..4dc353b
---- /dev/null
-+++ b/patches/0005-firmware-utils-add-mkdeadbeaf-for-Zyxel-NWA5123-AC.patch
-@@ -0,0 +1,332 @@
-+From: OpenWrt <noreply@openwrt.org>
-+Subject: [PATCH] ath79: firmware utils add mkdeadbeaf for Zyxel NWA5123 AC
-+
-+---
-+diff --git a/scripts/mkdeadbeaf.c b/scripts/mkdeadbeaf.c
-+new file mode 100644
-+index 0000000..472b918
-+--- /dev/null
-++++ b/scripts/mkdeadbeaf.c
-+@@ -0,0 +1,321 @@
-++// SPDX-License-Identifier: GPL-2.0-or-later
-++/*
-++ * mkdeadbeaf - Build Zyxel "deadbeaf" firmware images
-++ *
-++ * Used by: NWA5123-AC and similar Zyxel NWA access points
-++ *
-++ * The firmware file has a 648-byte header followed by kernel and rootfs data.
-++ * Checksums use MD5 word-sum: sum of 4 big-endian 32-bit words from the
-++ * MD5 digest, mod 2^32 (returns 1 if result is 0).
-++ *
-++ * Copyright (C) 2024 OpenWrt.org
-++ */
-++
-++#include <byteswap.h>
-++#include <endian.h>
-++#include <errno.h>
-++#include <fcntl.h>
-++#include <getopt.h>
-++#include <stdint.h>
-++#include <stdio.h>
-++#include <stdlib.h>
-++#include <string.h>
-++#include <sys/stat.h>
-++#include <unistd.h>
-++
-++#include "md5.h"
-++
-++#if __BYTE_ORDER == __BIG_ENDIAN
-++#define cpu_to_be16(x) (x)
-++#define cpu_to_be32(x) (x)
-++#elif __BYTE_ORDER == __LITTLE_ENDIAN
-++#define cpu_to_be16(x) bswap_16(x)
-++#define cpu_to_be32(x) bswap_32(x)
-++#else
-++#error "unsupported endianness"
-++#endif
-++
-++#define DEADBEAF_MAGIC		0xDEADBEAF
-++#define PRE_HEADER_SIZE		108
-++#define SECTION_ENTRY0_SIZE	272
-++#define SECTION_ENTRY1_SIZE	268
-++#define KERNEL_SUB_HDR_SIZE	512
-++#define HEADER_SIZE		(PRE_HEADER_SIZE + SECTION_ENTRY0_SIZE + SECTION_ENTRY1_SIZE)
-++#define FILENAME_LEN		64
-++#define PARTITION_LEN		64
-++
-++/* Default flash offsets for NWA5123-AC */
-++#define DEFAULT_KERNEL_OFFSET	0x00180000
-++#define DEFAULT_ROOTFS_OFFSET	0x002A0000
-++
-++struct deadbeaf_header {
-++	uint32_t master_crc;
-++	uint32_t magic;
-++	uint32_t type;
-++	uint32_t model_id;
-++	uint32_t reserved1;
-++	uint32_t reserved2;
-++	uint32_t file_size;
-++	uint16_t header_size;
-++	uint16_t pre_header_size;
-++	uint32_t flags;
-++	uint8_t  pad1[4];
-++	char     version[32];
-++	char     board[32];
-++	uint16_t num_sections;
-++	uint16_t pad2;
-++} __attribute__((packed));
-++
-++struct section_entry0 {
-++	uint32_t size;
-++	uint32_t checksum;
-++	uint32_t flash_offset;
-++	char     filename[FILENAME_LEN];
-++	char     partition[PARTITION_LEN];
-++	uint8_t  pad[SECTION_ENTRY0_SIZE - 12 - FILENAME_LEN - PARTITION_LEN];
-++} __attribute__((packed));
-++
-++struct section_entry1 {
-++	uint32_t size;
-++	uint32_t checksum;
-++	uint32_t flash_offset;
-++	char     filename[FILENAME_LEN];
-++	char     partition[PARTITION_LEN];
-++	uint8_t  pad[SECTION_ENTRY1_SIZE - 12 - FILENAME_LEN - PARTITION_LEN];
-++} __attribute__((packed));
-++
-++static const char *progname;
-++
-++static uint32_t md5ws(const void *data, size_t len)
-++{
-++	MD5_CTX ctx;
-++	uint8_t digest[16];
-++	uint32_t w[4], sum;
-++	int i;
-++
-++	MD5_Init(&ctx);
-++	MD5_Update(&ctx, data, len);
-++	MD5_Final(digest, &ctx);
-++
-++	for (i = 0; i < 4; i++)
-++		w[i] = ((uint32_t)digest[i * 4] << 24) |
-++		       ((uint32_t)digest[i * 4 + 1] << 16) |
-++		       ((uint32_t)digest[i * 4 + 2] << 8) |
-++		       ((uint32_t)digest[i * 4 + 3]);
-++
-++	sum = (w[0] + w[1] + w[2] + w[3]) & 0xFFFFFFFF;
-++	return sum ? sum : 1;
-++}
-++
-++static void *map_file(const char *path, size_t *size)
-++{
-++	struct stat st;
-++	FILE *fp;
-++	void *buf;
-++
-++	if (stat(path, &st)) {
-++		fprintf(stderr, "%s: stat %s: %s\n", progname, path,
-++			strerror(errno));
-++		return NULL;
-++	}
-++	*size = st.st_size;
-++
-++	buf = malloc(*size);
-++	if (!buf) {
-++		fprintf(stderr, "%s: malloc(%zu): %s\n", progname, *size,
-++			strerror(errno));
-++		return NULL;
-++	}
-++
-++	fp = fopen(path, "rb");
-++	if (!fp) {
-++		fprintf(stderr, "%s: open %s: %s\n", progname, path,
-++			strerror(errno));
-++		free(buf);
-++		return NULL;
-++	}
-++
-++	if (fread(buf, 1, *size, fp) != *size) {
-++		fprintf(stderr, "%s: short read on %s\n", progname, path);
-++		fclose(fp);
-++		free(buf);
-++		return NULL;
-++	}
-++
-++	fclose(fp);
-++	return buf;
-++}
-++
-++static void usage(int status)
-++{
-++	fprintf(stderr,
-++		"Usage: %s [OPTIONS]\n"
-++		"  -B <board>     board name (required)\n"
-++		"  -k <file>      kernel image (required)\n"
-++		"  -r <file>      rootfs image (required)\n"
-++		"  -o <file>      output file (required)\n"
-++		"  -v <version>   firmware version string (default: 1.00.00)\n"
-++		"  -K <offset>    kernel flash offset (default: 0x%x)\n"
-++		"  -R <offset>    rootfs flash offset (default: 0x%x)\n"
-++		"  -h             show this help\n",
-++		progname, DEFAULT_KERNEL_OFFSET, DEFAULT_ROOTFS_OFFSET);
-++	exit(status);
-++}
-++
-++int main(int argc, char *argv[])
-++{
-++	struct deadbeaf_header hdr;
-++	struct section_entry0 s0;
-++	struct section_entry1 s1;
-++	uint8_t sub_hdr[KERNEL_SUB_HDR_SIZE];
-++	const char *board = NULL, *kernel_path = NULL;
-++	const char *rootfs_path = NULL, *output_path = NULL;
-++	const char *version = "1.00.00";
-++	uint32_t kernel_offset = DEFAULT_KERNEL_OFFSET;
-++	uint32_t rootfs_offset = DEFAULT_ROOTFS_OFFSET;
-++	void *kernel_data, *rootfs_data, *file_buf;
-++	size_t kernel_size, rootfs_size, file_size;
-++	char name_buf[FILENAME_LEN];
-++	FILE *fp;
-++	int opt, i;
-++
-++	progname = argv[0];
-++
-++	while ((opt = getopt(argc, argv, "B:k:r:o:v:K:R:h")) != -1) {
-++		switch (opt) {
-++		case 'B':
-++			board = optarg;
-++			break;
-++		case 'k':
-++			kernel_path = optarg;
-++			break;
-++		case 'r':
-++			rootfs_path = optarg;
-++			break;
-++		case 'o':
-++			output_path = optarg;
-++			break;
-++		case 'v':
-++			version = optarg;
-++			break;
-++		case 'K':
-++			kernel_offset = strtoul(optarg, NULL, 0);
-++			break;
-++		case 'R':
-++			rootfs_offset = strtoul(optarg, NULL, 0);
-++			break;
-++		case 'h':
-++			usage(0);
-++		default:
-++			usage(1);
-++		}
-++	}
-++
-++	if (!board || !kernel_path || !rootfs_path || !output_path) {
-++		fprintf(stderr, "%s: missing required arguments\n", progname);
-++		usage(1);
-++	}
-++
-++	kernel_data = map_file(kernel_path, &kernel_size);
-++	if (!kernel_data)
-++		return 1;
-++
-++	rootfs_data = map_file(rootfs_path, &rootfs_size);
-++	if (!rootfs_data)
-++		return 1;
-++
-++	/* Section 0 includes 512-byte sub-header + kernel */
-++	file_size = HEADER_SIZE + KERNEL_SUB_HDR_SIZE + kernel_size + rootfs_size;
-++
-++	/* Build pre-header */
-++	memset(&hdr, 0, sizeof(hdr));
-++	hdr.master_crc = 0; /* placeholder */
-++	hdr.magic = cpu_to_be32(DEADBEAF_MAGIC);
-++	hdr.type = cpu_to_be32(0x01000002);
-++	hdr.model_id = 0;
-++	hdr.reserved1 = cpu_to_be32(0xFFFFFFFF);
-++	hdr.reserved2 = cpu_to_be32(0xFFFFFFFF);
-++	hdr.file_size = cpu_to_be32(file_size);
-++	hdr.header_size = cpu_to_be16(HEADER_SIZE);
-++	hdr.pre_header_size = cpu_to_be16(PRE_HEADER_SIZE);
-++	hdr.flags = cpu_to_be32(0x01100000);
-++	strncpy(hdr.version, version, sizeof(hdr.version) - 1);
-++	strncpy(hdr.board, board, sizeof(hdr.board) - 1);
-++	hdr.num_sections = cpu_to_be16(2);
-++
-++	/* Build section entry 0 (kernel) */
-++	memset(&s0, 0, sizeof(s0));
-++	s0.size = cpu_to_be32(KERNEL_SUB_HDR_SIZE + kernel_size);
-++	s0.checksum = cpu_to_be32(md5ws(kernel_data, kernel_size));
-++	s0.flash_offset = cpu_to_be32(kernel_offset);
-++
-++	/* Build filename: "kernel<board_lowercase>.bin" */
-++	memset(name_buf, 0, sizeof(name_buf));
-++	snprintf(name_buf, sizeof(name_buf), "kernel");
-++	i = strlen(name_buf);
-++	strncpy(name_buf + i, board, sizeof(name_buf) - i - 5);
-++	for (; name_buf[i]; i++)
-++		if (name_buf[i] >= 'A' && name_buf[i] <= 'Z')
-++			name_buf[i] += 'a' - 'A';
-++	strncat(name_buf, ".bin", sizeof(name_buf) - strlen(name_buf) - 1);
-++	strncpy(s0.filename, name_buf, FILENAME_LEN - 1);
-++	strncpy(s0.partition, "kernel", PARTITION_LEN - 1);
-++
-++	/* Build section entry 1 (rootfs) */
-++	memset(&s1, 0, sizeof(s1));
-++	s1.size = cpu_to_be32(rootfs_size);
-++	s1.checksum = cpu_to_be32(md5ws(rootfs_data, rootfs_size));
-++	s1.flash_offset = cpu_to_be32(rootfs_offset);
-++	strncpy(s1.filename, "squashfs_ro.img", FILENAME_LEN - 1);
-++	strncpy(s1.partition, "zldfs", PARTITION_LEN - 1);
-++
-++	/* Kernel sub-header is all zeros for OpenWrt images */
-++	memset(sub_hdr, 0, sizeof(sub_hdr));
-++
-++	/* Assemble the complete file in memory for master checksum */
-++	file_buf = malloc(file_size);
-++	if (!file_buf) {
-++		fprintf(stderr, "%s: malloc(%zu) failed\n", progname, file_size);
-++		return 1;
-++	}
-++
-++	memcpy(file_buf, &hdr, sizeof(hdr));
-++	memcpy(file_buf + PRE_HEADER_SIZE, &s0, sizeof(s0));
-++	memcpy(file_buf + PRE_HEADER_SIZE + SECTION_ENTRY0_SIZE, &s1, sizeof(s1));
-++	memcpy(file_buf + HEADER_SIZE, sub_hdr, sizeof(sub_hdr));
-++	memcpy(file_buf + HEADER_SIZE + KERNEL_SUB_HDR_SIZE,
-++	       kernel_data, kernel_size);
-++	memcpy(file_buf + HEADER_SIZE + KERNEL_SUB_HDR_SIZE + kernel_size,
-++	       rootfs_data, rootfs_size);
-++
-++	/* Compute master checksum: md5ws(file[4:]) */
-++	{
-++		uint32_t master = md5ws((uint8_t *)file_buf + 4, file_size - 4);
-++		((struct deadbeaf_header *)file_buf)->master_crc =
-++			cpu_to_be32(master);
-++	}
-++
-++	/* Write output */
-++	fp = fopen(output_path, "wb");
-++	if (!fp) {
-++		fprintf(stderr, "%s: open %s: %s\n", progname, output_path,
-++			strerror(errno));
-++		return 1;
-++	}
-++
-++	if (fwrite(file_buf, 1, file_size, fp) != file_size) {
-++		fprintf(stderr, "%s: write error\n", progname);
-++		fclose(fp);
-++		return 1;
-++	}
-++
-++	fclose(fp);
-++	free(file_buf);
-++	free(kernel_data);
-++	free(rootfs_data);
-++
-++	fprintf(stderr, "%s: %s kernel=%zu rootfs=%zu total=%zu\n",
-++		progname, board, kernel_size, rootfs_size, file_size);
-++
-++	return 0;
-++}
-+-- 
-diff --git a/scripts/mkdeadbeaf.c b/scripts/mkdeadbeaf.c
-new file mode 100644
-index 0000000..472b918
---- /dev/null
-+++ b/scripts/mkdeadbeaf.c
-@@ -0,0 +1,321 @@
-+// SPDX-License-Identifier: GPL-2.0-or-later
-+/*
-+ * mkdeadbeaf - Build Zyxel "deadbeaf" firmware images
-+ *
-+ * Used by: NWA5123-AC and similar Zyxel NWA access points
-+ *
-+ * The firmware file has a 648-byte header followed by kernel and rootfs data.
-+ * Checksums use MD5 word-sum: sum of 4 big-endian 32-bit words from the
-+ * MD5 digest, mod 2^32 (returns 1 if result is 0).
-+ *
-+ * Copyright (C) 2024 OpenWrt.org
-+ */
-+
-+#include <byteswap.h>
-+#include <endian.h>
-+#include <errno.h>
-+#include <fcntl.h>
-+#include <getopt.h>
-+#include <stdint.h>
-+#include <stdio.h>
-+#include <stdlib.h>
-+#include <string.h>
-+#include <sys/stat.h>
-+#include <unistd.h>
-+
-+#include "md5.h"
-+
-+#if __BYTE_ORDER == __BIG_ENDIAN
-+#define cpu_to_be16(x) (x)
-+#define cpu_to_be32(x) (x)
-+#elif __BYTE_ORDER == __LITTLE_ENDIAN
-+#define cpu_to_be16(x) bswap_16(x)
-+#define cpu_to_be32(x) bswap_32(x)
-+#else
-+#error "unsupported endianness"
-+#endif
-+
-+#define DEADBEAF_MAGIC		0xDEADBEAF
-+#define PRE_HEADER_SIZE		108
-+#define SECTION_ENTRY0_SIZE	272
-+#define SECTION_ENTRY1_SIZE	268
-+#define KERNEL_SUB_HDR_SIZE	512
-+#define HEADER_SIZE		(PRE_HEADER_SIZE + SECTION_ENTRY0_SIZE + SECTION_ENTRY1_SIZE)
-+#define FILENAME_LEN		64
-+#define PARTITION_LEN		64
-+
-+/* Default flash offsets for NWA5123-AC */
-+#define DEFAULT_KERNEL_OFFSET	0x00180000
-+#define DEFAULT_ROOTFS_OFFSET	0x002A0000
-+
-+struct deadbeaf_header {
-+	uint32_t master_crc;
-+	uint32_t magic;
-+	uint32_t type;
-+	uint32_t model_id;
-+	uint32_t reserved1;
-+	uint32_t reserved2;
-+	uint32_t file_size;
-+	uint16_t header_size;
-+	uint16_t pre_header_size;
-+	uint32_t flags;
-+	uint8_t  pad1[4];
-+	char     version[32];
-+	char     board[32];
-+	uint16_t num_sections;
-+	uint16_t pad2;
-+} __attribute__((packed));
-+
-+struct section_entry0 {
-+	uint32_t size;
-+	uint32_t checksum;
-+	uint32_t flash_offset;
-+	char     filename[FILENAME_LEN];
-+	char     partition[PARTITION_LEN];
-+	uint8_t  pad[SECTION_ENTRY0_SIZE - 12 - FILENAME_LEN - PARTITION_LEN];
-+} __attribute__((packed));
-+
-+struct section_entry1 {
-+	uint32_t size;
-+	uint32_t checksum;
-+	uint32_t flash_offset;
-+	char     filename[FILENAME_LEN];
-+	char     partition[PARTITION_LEN];
-+	uint8_t  pad[SECTION_ENTRY1_SIZE - 12 - FILENAME_LEN - PARTITION_LEN];
-+} __attribute__((packed));
-+
-+static const char *progname;
-+
-+static uint32_t md5ws(const void *data, size_t len)
-+{
-+	MD5_CTX ctx;
-+	uint8_t digest[16];
-+	uint32_t w[4], sum;
-+	int i;
-+
-+	MD5_Init(&ctx);
-+	MD5_Update(&ctx, data, len);
-+	MD5_Final(digest, &ctx);
-+
-+	for (i = 0; i < 4; i++)
-+		w[i] = ((uint32_t)digest[i * 4] << 24) |
-+		       ((uint32_t)digest[i * 4 + 1] << 16) |
-+		       ((uint32_t)digest[i * 4 + 2] << 8) |
-+		       ((uint32_t)digest[i * 4 + 3]);
-+
-+	sum = (w[0] + w[1] + w[2] + w[3]) & 0xFFFFFFFF;
-+	return sum ? sum : 1;
++log() {
++	echo "zyxel-nwa5123-ac-slot-mirror: $*" >/dev/kmsg 2>/dev/null || true
++	logger -t zyxel-nwa5123-ac-slot-mirror -- "$*" 2>/dev/null || true
 +}
 +
-+static void *map_file(const char *path, size_t *size)
-+{
-+	struct stat st;
-+	FILE *fp;
-+	void *buf;
-+
-+	if (stat(path, &st)) {
-+		fprintf(stderr, "%s: stat %s: %s\n", progname, path,
-+			strerror(errno));
-+		return NULL;
-+	}
-+	*size = st.st_size;
-+
-+	buf = malloc(*size);
-+	if (!buf) {
-+		fprintf(stderr, "%s: malloc(%zu): %s\n", progname, *size,
-+			strerror(errno));
-+		return NULL;
-+	}
-+
-+	fp = fopen(path, "rb");
-+	if (!fp) {
-+		fprintf(stderr, "%s: open %s: %s\n", progname, path,
-+			strerror(errno));
-+		free(buf);
-+		return NULL;
-+	}
-+
-+	if (fread(buf, 1, *size, fp) != *size) {
-+		fprintf(stderr, "%s: short read on %s\n", progname, path);
-+		fclose(fp);
-+		free(buf);
-+		return NULL;
-+	}
-+
-+	fclose(fp);
-+	return buf;
++find_mtd() {
++	sed -n "s/^\(mtd[0-9]\+\):[^\"]*\"$1\"\$/\1/p" /proc/mtd
 +}
 +
-+static void usage(int status)
-+{
-+	fprintf(stderr,
-+		"Usage: %s [OPTIONS]\n"
-+		"  -B <board>     board name (required)\n"
-+		"  -k <file>      kernel image (required)\n"
-+		"  -r <file>      rootfs image (required)\n"
-+		"  -o <file>      output file (required)\n"
-+		"  -v <version>   firmware version string (default: 1.00.00)\n"
-+		"  -K <offset>    kernel flash offset (default: 0x%x)\n"
-+		"  -R <offset>    rootfs flash offset (default: 0x%x)\n"
-+		"  -h             show this help\n",
-+		progname, DEFAULT_KERNEL_OFFSET, DEFAULT_ROOTFS_OFFSET);
-+	exit(status);
++magic_at() {
++	dd if="$1" bs=1 count=4 2>/dev/null | hexdump -v -e '/1 "%02x"'
 +}
 +
-+int main(int argc, char *argv[])
-+{
-+	struct deadbeaf_header hdr;
-+	struct section_entry0 s0;
-+	struct section_entry1 s1;
-+	uint8_t sub_hdr[KERNEL_SUB_HDR_SIZE];
-+	const char *board = NULL, *kernel_path = NULL;
-+	const char *rootfs_path = NULL, *output_path = NULL;
-+	const char *version = "1.00.00";
-+	uint32_t kernel_offset = DEFAULT_KERNEL_OFFSET;
-+	uint32_t rootfs_offset = DEFAULT_ROOTFS_OFFSET;
-+	void *kernel_data, *rootfs_data, *file_buf;
-+	size_t kernel_size, rootfs_size, file_size;
-+	char name_buf[FILENAME_LEN];
-+	FILE *fp;
-+	int opt, i;
++# Loader (sub_hdr + OKLI uImage stub) slots:
++cs0_loader_part=zy-image0
++cs1_loader_part=zy-image1-loader
++# Firmware (kernel + rootfs, starts with the OKLI uImage magic) slots:
++cs0_fw_part=firmware2
++cs1_fw_part=firmware
 +
-+	progname = argv[0];
++cs0_loader_mtd=$(find_mtd "$cs0_loader_part")
++cs1_loader_mtd=$(find_mtd "$cs1_loader_part")
++cs0_fw_mtd=$(find_mtd "$cs0_fw_part")
++cs1_fw_mtd=$(find_mtd "$cs1_fw_part")
++if [ -z "$cs0_loader_mtd" ] || [ -z "$cs1_loader_mtd" ] || \
++   [ -z "$cs0_fw_mtd" ] || [ -z "$cs1_fw_mtd" ]; then
++	log "mtd lookup failed (loaders: cs0=$cs0_loader_mtd cs1=$cs1_loader_mtd;" \
++	    "firmwares: cs0=$cs0_fw_mtd cs1=$cs1_fw_mtd)"
++	exit 0
++fi
 +
-+	while ((opt = getopt(argc, argv, "B:k:r:o:v:K:R:h")) != -1) {
-+		switch (opt) {
-+		case 'B':
-+			board = optarg;
-+			break;
-+		case 'k':
-+			kernel_path = optarg;
-+			break;
-+		case 'r':
-+			rootfs_path = optarg;
-+			break;
-+		case 'o':
-+			output_path = optarg;
-+			break;
-+		case 'v':
-+			version = optarg;
-+			break;
-+		case 'K':
-+			kernel_offset = strtoul(optarg, NULL, 0);
-+			break;
-+		case 'R':
-+			rootfs_offset = strtoul(optarg, NULL, 0);
-+			break;
-+		case 'h':
-+			usage(0);
-+		default:
-+			usage(1);
-+		}
-+	}
++cs0_fw_magic=$(magic_at "/dev/$cs0_fw_mtd")
++cs1_fw_magic=$(magic_at "/dev/$cs1_fw_mtd")
 +
-+	if (!board || !kernel_path || !rootfs_path || !output_path) {
-+		fprintf(stderr, "%s: missing required arguments\n", progname);
-+		usage(1);
-+	}
++# Figure out where ZLD just flashed OpenWrt by checking the OKLI
++# magic at the START of each firmware partition. The matching loader
++# slot (= same chip) is the source; the other chip's loader slot is
++# the destination.
++if [ "$cs0_fw_magic" = "$OKLI_MAGIC" ] && [ "$cs1_fw_magic" = "$OKLI_MAGIC" ]; then
++	log "both firmware slots carry OpenWrt already, nothing to clone"
++	exit 0
++elif [ "$cs0_fw_magic" = "$OKLI_MAGIC" ]; then
++	src_dev=/dev/$cs0_loader_mtd
++	dst_dev=/dev/$cs1_loader_mtd
++	dst_part=$cs1_loader_part
++	log "OpenWrt lives on CS0, mirroring loader into $dst_part"
++elif [ "$cs1_fw_magic" = "$OKLI_MAGIC" ]; then
++	src_dev=/dev/$cs1_loader_mtd
++	dst_dev=/dev/$cs0_loader_mtd
++	dst_part=$cs0_loader_part
++	log "OpenWrt lives on CS1, mirroring loader into $dst_part"
++else
++	log "no OKLI magic found on either firmware slot" \
++	    "(cs0_fw=$cs0_fw_magic cs1_fw=$cs1_fw_magic)"
++	exit 0
++fi
 +
-+	kernel_data = map_file(kernel_path, &kernel_size);
-+	if (!kernel_data)
-+		return 1;
++log "mirroring OKLI from $src_dev into $dst_part"
 +
-+	rootfs_data = map_file(rootfs_path, &rootfs_size);
-+	if (!rootfs_data)
-+		return 1;
++tmp=$(mktemp)
++trap 'rm -f "$tmp"' EXIT
 +
-+	/* Section 0 includes 512-byte sub-header + kernel */
-+	file_size = HEADER_SIZE + KERNEL_SUB_HDR_SIZE + kernel_size + rootfs_size;
++# Read the destination slot in full so we preserve anything past the
++# OKLI kernel area (= the stock Zyxel zldfs bytes); overwrite only the
++# first 1152k with the source slot's OKLI stub + sub_hdr.
++if ! dd if="$dst_dev" of="$tmp" 2>/dev/null; then
++	log "read failed on $dst_dev"
++	exit 0
++fi
++if ! dd if="$src_dev" of="$tmp" bs=65536 count=18 \
++	conv=notrunc 2>/dev/null; then
++	log "src read failed on $src_dev"
++	exit 0
++fi
 +
-+	/* Build pre-header */
-+	memset(&hdr, 0, sizeof(hdr));
-+	hdr.master_crc = 0; /* placeholder */
-+	hdr.magic = cpu_to_be32(DEADBEAF_MAGIC);
-+	hdr.type = cpu_to_be32(0x01000002);
-+	hdr.model_id = 0;
-+	hdr.reserved1 = cpu_to_be32(0xFFFFFFFF);
-+	hdr.reserved2 = cpu_to_be32(0xFFFFFFFF);
-+	hdr.file_size = cpu_to_be32(file_size);
-+	hdr.header_size = cpu_to_be16(HEADER_SIZE);
-+	hdr.pre_header_size = cpu_to_be16(PRE_HEADER_SIZE);
-+	hdr.flags = cpu_to_be32(0x01100000);
-+	strncpy(hdr.version, version, sizeof(hdr.version) - 1);
-+	strncpy(hdr.board, board, sizeof(hdr.board) - 1);
-+	hdr.num_sections = cpu_to_be16(2);
++if mtd -q write "$tmp" "$dst_part"; then
++	log "mirrored; ZLD will now boot OpenWrt regardless of bootImage flag"
++else
++	log "mtd write failed on $dst_part"
++fi
 +
-+	/* Build section entry 0 (kernel) */
-+	memset(&s0, 0, sizeof(s0));
-+	s0.size = cpu_to_be32(KERNEL_SUB_HDR_SIZE + kernel_size);
-+	s0.checksum = cpu_to_be32(md5ws(kernel_data, kernel_size));
-+	s0.flash_offset = cpu_to_be32(kernel_offset);
++exit 0
+diff --git a/target/linux/ath79/image/README-zyxel-nwa5123-ac.md b/target/linux/ath79/image/README-zyxel-nwa5123-ac.md
+new file mode 100644
+index 0000000000..8027494cb7
+--- /dev/null
++++ b/target/linux/ath79/image/README-zyxel-nwa5123-ac.md
+@@ -0,0 +1,248 @@
++# Zyxel NWA5123-AC
 +
-+	/* Build filename: "kernel<board_lowercase>.bin" */
-+	memset(name_buf, 0, sizeof(name_buf));
-+	snprintf(name_buf, sizeof(name_buf), "kernel");
-+	i = strlen(name_buf);
-+	strncpy(name_buf + i, board, sizeof(name_buf) - i - 5);
-+	for (; name_buf[i]; i++)
-+		if (name_buf[i] >= 'A' && name_buf[i] <= 'Z')
-+			name_buf[i] += 'a' - 'A';
-+	strncat(name_buf, ".bin", sizeof(name_buf) - strlen(name_buf) - 1);
-+	strncpy(s0.filename, name_buf, FILENAME_LEN - 1);
-+	strncpy(s0.partition, "kernel", PARTITION_LEN - 1);
++Dual-band 802.11ac access point built on Qualcomm Atheros AR9344
++(MIPS 74Kc, 560 MHz) with 128 MB DDR2 and two 16 MB SPI NOR flash
++chips (Macronix). WLAN: on-chip AR9340 for 2.4 GHz, QCA988X on PCIe
++for 5 GHz, GbE via AR8035 PHY.
 +
-+	/* Build section entry 1 (rootfs) */
-+	memset(&s1, 0, sizeof(s1));
-+	s1.size = cpu_to_be32(rootfs_size);
-+	s1.checksum = cpu_to_be32(md5ws(rootfs_data, rootfs_size));
-+	s1.flash_offset = cpu_to_be32(rootfs_offset);
-+	strncpy(s1.filename, "squashfs_ro.img", FILENAME_LEN - 1);
-+	strncpy(s1.partition, "zldfs", PARTITION_LEN - 1);
++## Flash layout at a glance
 +
-+	/* Kernel sub-header is all zeros for OpenWrt images */
-+	memset(sub_hdr, 0, sizeof(sub_hdr));
++The device ships with Zyxel's proprietary ZLD bootbase (a locked-down
++U-Boot 1.1.4 fork) that manages a Zyxel-flavoured dualimage setup:
 +
-+	/* Assemble the complete file in memory for master checksum */
-+	file_buf = malloc(file_size);
-+	if (!file_buf) {
-+		fprintf(stderr, "%s: malloc(%zu) failed\n", progname, file_size);
-+		return 1;
-+	}
++```
++CS0 (nor0, memory-mapped at 0x1F000000):
++   0x000000-0x030000  u-boot            (ZLD bootbase, read-only)
++   0x030000-0x150000  zy-image0         (OKLI stub, mirrored on first boot)
++   0x150000-0xEA0000  firmware2         (OpenWrt kernel + rootfs when ZLD lands here)
++   0xEA0000-0xFA0000  zy-conf           (Zyxel's running-config JFFS2)
++   0xFA0000-0xFB0000  zy-myZyXEL        (empty slot)
++   0xFB0000-0xFC0000  zy-mrd            (manufacturer data, MAC in last 8 bytes)
++   0xFC0000-0xFF0000  zy-disklog        (Zyxel kernel ring-buffer)
++   0xFF0000-0x1000000 art               (ath9k calibration)
 +
-+	memcpy(file_buf, &hdr, sizeof(hdr));
-+	memcpy(file_buf + PRE_HEADER_SIZE, &s0, sizeof(s0));
-+	memcpy(file_buf + PRE_HEADER_SIZE + SECTION_ENTRY0_SIZE, &s1, sizeof(s1));
-+	memcpy(file_buf + HEADER_SIZE, sub_hdr, sizeof(sub_hdr));
-+	memcpy(file_buf + HEADER_SIZE + KERNEL_SUB_HDR_SIZE,
-+	       kernel_data, kernel_size);
-+	memcpy(file_buf + HEADER_SIZE + KERNEL_SUB_HDR_SIZE + kernel_size,
-+	       rootfs_data, rootfs_size);
++CS1 (nor1, not memory-mapped; read via SPI commands in the OKLI loader):
++   0x000000-0x180000  reserve           (Zyxel's built-in 4.22 recovery image)
++   0x180000-0x2A0000  zy-image1-loader  (deadbeaf sub_hdr + OKLI uImage)
++   0x2A0000-0xFF0000  firmware          (OKLI's kernel uImage + squashfs rootfs)
++   0xFF0000-0x1000000 myZyXEL           (empty slot)
++```
 +
-+	/* Compute master checksum: md5ws(file[4:]) */
-+	{
-+		uint32_t master = md5ws((uint8_t *)file_buf + 4, file_size - 4);
-+		((struct deadbeaf_header *)file_buf)->master_crc =
-+			cpu_to_be32(master);
-+	}
++The MAC address printed on the sticker (eth0) is read from `zy-mrd`
++at offset 0xfff8. The 2.4 GHz radio uses that MAC + 1, the 5 GHz
++radio uses that MAC + 2.
 +
-+	/* Write output */
-+	fp = fopen(output_path, "wb");
-+	if (!fp) {
-+		fprintf(stderr, "%s: open %s: %s\n", progname, output_path,
-+			strerror(errno));
-+		return 1;
-+	}
++## How boot works
 +
-+	if (fwrite(file_buf, 1, file_size, fp) != file_size) {
-+		fprintf(stderr, "%s: write error\n", progname);
-+		fclose(fp);
-+		return 1;
-+	}
++ZLD can only boot kernels wrapped in Zyxel's "deadbeaf" container
++(magic 0xDEADBEAF, 108-byte pre-header + 272-byte section entries +
++512-byte sub_hdr, followed by a standard U-Boot uImage). Because CS1
++isn't memory-mapped, a plain uImage there is unreadable: ZLD would
++try to `bootm 0x9e180000` and get garbage.
 +
-+	fclose(fp);
-+	free(file_buf);
-+	free(kernel_data);
-+	free(rootfs_data);
++The solution is OpenWrt's OKLI (OpenWrt Kernel LZMA Image) loader stub:
 +
-+	fprintf(stderr, "%s: %s kernel=%zu rootfs=%zu total=%zu\n",
-+		progname, board, kernel_size, rootfs_size, file_size);
++1. ZLD boots the deadbeaf-wrapped **OKLI stub** at `0x180200` on CS1
++   (or on CS0, see next section). The stub is tiny (~65 KiB padded).
++2. The stub runs in RAM, finds the real uImage magic in flash,
++   LZMA-decompresses the kernel into RAM at `KERNEL_LOADADDR`, and
++   jumps to it.
++3. Linux boots from there as usual.
 +
-+	return 0;
-+}
++The OKLI customisation lives in
++`target/linux/ath79/image/lzma-loader/src/loader.c`
++(`CONFIG_FLASH_CS1` for the SPI-based read on CS1,
++`CONFIG_FLASH_CS0_FALLBACK` for the memory-mapped fallback on CS0).
++
++## The "which slot does ZLD boot" problem
++
++Zyxel ships NWA5123-AC units with the ex-factory `bootImage` flag at
++either 0 or 1, and the flag is sticky — nothing accessible from the
++bootbase CLI reliably flips it, and writing to `sub_hdr+0x80` marks
++the slot as `Fail` permanently.
++
++Because ATNZ writes to the *inactive* slot:
++
++- A `bootImage=0` unit lands OpenWrt on CS1 (zy-image1-loader).
++- A `bootImage=1` unit lands OpenWrt on CS0 (zy-image0).
++
++To make a single factory.bin work for both:
++
++1. **Universal OKLI loader** — the stub probes CS0's memory-mapped
++   region first (`LOADER_FLASH_CS0_FALLBACK=0x150000`); if it finds
++   the OKLI uImage magic there, it boots from CS0, otherwise it
++   falls back to SPI reads on CS1 at `0x2A0000`. One binary covers
++   both ex-factory flag values.
++2. **Slot-mirror on first boot** — the uci-defaults script
++   `99_zyxel-nwa5123-ac-slot-mirror` detects where ZLD actually
++   flashed OpenWrt (OKLI magic at offset 0 of `firmware` or
++   `firmware2`), clones the OKLI stub into the *other* slot's loader
++   partition, and preserves everything beyond the first 1152 KiB.
++   After that both slots carry our OKLI stub; whichever slot ZLD
++   picks on the next power-on boots OpenWrt.
++3. **firmware2 partition on CS0** — the DT exposes `zy-image0`'s
++   rootfs area as a second `openwrt,uimage` partition with
++   `IH_MAGIC_OKLI`. On a `bootImage=1` unit, mtdsplit finds the OKLI
++   magic there and splits off a rootfs. On a `bootImage=0` unit the
++   same bytes are Zyxel's stock zldfs and mtdsplit skips the
++   partition silently.
++
++End result: after one UART-driven first flash, every subsequent
++power-cycle lands directly in OpenWrt, from either flash chip, with
++no serial-console intervention.
++
++## Installation
++
++### Via UART + ATNZ (recommended)
++
++Serial console: 3.3 V TTL, 115200 8N1. ZLD prints
++"Press any key to enter debug mode within 1 seconds" at power-on;
++any key drops into the `NWA5123-AC>` prompt.
++
++```
++ATNA 192.168.1.2       # device IP
++ATNS 192.168.1.1       # TFTP server IP
++ATNZ                   # pulls 'ZLD-current' via TFTP
++ATGO                   # boot the freshly flashed slot
++```
++
++Serve `openwrt-ath79-generic-zyxel_nwa5123-ac-squashfs-factory.bin`
++as `ZLD-current` from TFTP at 192.168.1.1.
++
++On first boot the `99_zyxel-nwa5123-ac-slot-mirror` uci-defaults
++script mirrors the OKLI stub into the other slot and deletes itself.
++From the next power cycle onward UART is no longer needed.
++
++### Via Zyxel web UI
++
++The stock web UI accepts firmware uploads that run through `ATNZ`
++internally. The factory.bin should be accepted since it matches the
++deadbeaf format. After upload + reboot, auto-boot works directly
++(the slot-mirror runs on first boot the same way).
++
++## Recovery
++
++### OpenWrt bricked, UART available
++
++Catch the bootbase prompt and `ATNZ` any valid deadbeaf image
++(OpenWrt factory.bin or Zyxel stock). ATNZ writes to the inactive
++slot and resets its status to `New`.
++
++### Back to Zyxel firmware
++
++With the slot-mirror strategy, both loader slots carry the OKLI
++stub. To go back to stock, `ATNZ` Zyxel's original `610AAZY8C0.bin`
++to overwrite the active slot's loader area, then flash it again
++(or flash the stock image into the other slot too via `mtd write`
++from within OpenWrt).
++
++### Nothing works any more
++
++Zyxel's internal recovery image sits at `nor1:0x000000` (`reserve`
++partition — a Zyxel 4.22 firmware). The trigger for ZLD to actually
++boot it is undocumented, but it is there as a safety net. Worst
++case: external SPI programmer on the SOIC-8 chip and re-flash
++`610AAZY8C0.bin` to CS0 directly.
++
++## Ethernet / RGMII caveat
++
++The AR8035 PHY needs careful delay handling. The combination of
++`phy-mode = "rgmii-id"` on `eth0` (MAC-side RX+TX delay) with the
++HiveAP-121-style `gmac-config` tuning is what works on this board:
++
++```dts
++&eth0 {
++    pll-data = <0x06000000 0x00000101 0x00001313>;
++    phy-mode = "rgmii-id";
++    phy-handle = <&phy0>;
++
++    gmac-config {
++        device = <&gmac>;
++        rgmii-gmac0 = <1>;
++        rxd-delay = <1>;
++        rxdv-delay = <1>;
++    };
++};
++```
++
++Using `rxd-delay = <3>` / `txd-delay = <3>` (as some ar9344 boards
++do) produces frames that leave the PHY corrupted — the link comes
++up at 1000M/Full but TX never reaches the switch (0 input packets
++on the trunk port, no MAC learned). Dropping the TX delays and
++reducing RX delay to `<1>` resolves it.
++
++## Mesh / batman-adv
++
++5 GHz mesh is not available because the ath10k-CT firmware refuses
++802.11s unless loaded with `rawmode=1`, which cripples offload. The
++2.4 GHz radio (ath9k) carries the batman-adv backhaul instead; the
++5 GHz radio stays dedicated to client APs.
++
++`batman-adv` and `batctl-tiny` are not part of the default image.
++Install `kmod-batman-adv`, `kmod-lib-crc16` and `batctl-tiny` (or
++enable `CONFIG_PACKAGE_kmod-batman-adv=y`,
++`CONFIG_PACKAGE_kmod-lib-crc16=y` and
++`CONFIG_PACKAGE_batctl-tiny=y` in the image config) before setting up
++the mesh.
++
++Minimal mesh config on each AP (identical `mesh_id` + PSK on all
++nodes):
++
++```
++config wifi-iface 'mesh_2g'
++    option device 'radio1'
++    option network 'mesh0'
++    option mode 'mesh'
++    option mesh_id 'NAME-OF-MESH'
++    option mesh_fwding '0'
++    option encryption 'sae'
++    option key '…'
++    option mtu '1536'           # batman OGMs need headroom
++```
++
++The debug tables under `/sys/kernel/debug/batman_adv/` are disabled
++in the current kernel; `batctl-tiny` has no `originators`/`neighbors`
++subcommand either. Verify mesh health by pinging a peer's mgmt IP
++across bat0 — a reply confirms peering + OGM exchange + L2 routing
++over the mesh.
++
++## 802.11r fast roaming
++
++Add the following to each client-facing `wifi-iface` (not to the
++mesh interface) on every AP. The same `mobility_domain` across all
++APs is what makes clients recognise them as one roaming domain.
++
++```
++option ieee80211r '1'
++option ft_over_ds '0'               # over-air FT
++option ft_psk_generate_local '1'    # local PMK-R0 holder, no RADIUS needed
++option mobility_domain 'c15c'       # 4 hex chars, identical on every AP
++option reassociation_deadline '20000'
++```
++
++## Known limitations
++
++- **The deadbeaf template is NWA5123-AC-specific.** The 512-byte
++  sub_hdr template in
++  `tools/firmware-utils/patches/100-add-mkdeadbeaf.patch` was
++  extracted verbatim from a stock `610AAZY8C0.bin` and includes
++  the device's model_id (0x000526E1) and bootbase pointer values.
++  Other Zyxel NWA models would need their own templates.
++- **sysupgrade not plumbed end-to-end.** `IMAGE/sysupgrade.bin` is
++  produced, but the upgrade path hasn't been exercised in anger.
++  For firmware updates, UART + ATNZ remains the reliable path.
++- **Zyxel's ZLD version string on flash is cosmetic only.** `ATDS`
++  always shows the stock bootbase version; it is not rewritten by
++  this port, and ZLD does not consult it at boot time.
++- **5 GHz mesh is not supported** on the shipped ath10k-CT firmware
++  (rawmode requirement). Mesh must run on the 2.4 GHz ath9k radio.
++
++## Related files
++
++| File | What it does |
++|------|--------------|
++| `target/linux/ath79/dts/ar9344_zyxel_nwa5123-ac.dts` | DT: dual-chip partition table, `firmware2` on CS0, MAC/calibration nvmem, LEDs, keys, AR8035 RGMII delays |
++| `target/linux/ath79/image/generic.mk` (search `zyxel_nwa5123`) | Build recipe: deadbeaf wrapper, universal OKLI loader (CS0 fallback + CS1), factory.bin |
++| `target/linux/ath79/image/lzma-loader/src/loader.c` (`CONFIG_FLASH_CS1`, `CONFIG_FLASH_CS0_FALLBACK`) | OKLI stub: probe CS0 memory-mapped, fall back to CS1 SPI |
++| `tools/firmware-utils/patches/100-add-mkdeadbeaf.patch` | Host tool that builds the deadbeaf image ZLD will accept |
++| `target/linux/ath79/generic/base-files/etc/uci-defaults/99_zyxel-nwa5123-ac-slot-mirror` | One-shot: clones OKLI stub into the other loader slot on first boot |
 diff --git a/target/linux/ath79/image/generic.mk b/target/linux/ath79/image/generic.mk
-index ef156dd..409e4ec 100644
+index ef156dd8db..01069a519e 100644
 --- a/target/linux/ath79/image/generic.mk
 +++ b/target/linux/ath79/image/generic.mk
-@@ -169,6 +169,15 @@ define Build/zyxel-tar-bz2
+@@ -11,6 +11,8 @@ DEVICE_VARS += KERNEL_INITRAMFS_PREFIX DAP_SIGNATURE
+ DEVICE_VARS += EDIMAX_HEADER_MAGIC EDIMAX_HEADER_MODEL
+ DEVICE_VARS += ELECOM_HWID
+ DEVICE_VARS += MOXA_MAGIC MOXA_HWID
++DEVICE_VARS += DEADBEAF_MODEL_ID DEADBEAF_PART_OFFS DEADBEAF_ROOTFS_OFFS DEADBEAF_ROOTFS_SIZE
++DEVICE_VARS += DEADBEAF_KERNEL_VERSION DEADBEAF_ZLD_VERSION DEADBEAF_BUILD_DATE
+ DEVICE_VARS += OPENMESH_CE_TYPE ZYXEL_MODEL_STRING
+ DEVICE_VARS += SUPPORTED_TELTONIKA_DEVICES
+ DEVICE_VARS += SUPPORTED_TELTONIKA_HW_MODS
+@@ -169,6 +171,75 @@ define Build/zyxel-tar-bz2
  	rm -rf $@.tmp
  endef
  
@@ -1108,15 +419,75 @@ index ef156dd..409e4ec 100644
 +	$(STAGING_DIR_HOST)/bin/mkdeadbeaf \
 +		-B $(1) \
 +		-k $(IMAGE_KERNEL) \
-+		-r $@ \
-+		-o $@.new
++		-r $(IMAGE_ROOTFS) \
++		-K $(LOADER_FLASH_OFFS) \
++		$(if $(DEADBEAF_MODEL_ID),-m $(DEADBEAF_MODEL_ID)) \
++		-o $@
++endef
++
++# Like zyxel-deadbeaf but splits the OKLI loader and kernel across sections
++# for factory installation via ZLD.
++#
++# ZLD maps section partition names to flash offsets from the partition table,
++# ignoring the flash_offset fields in section entries.  It writes the "kernel"
++# section to the kernel partition and "zldfs" to the zldfs partition.
++#
++# The kernel partition (1152k on NWA5123-AC) is too small for the combined
++# loader + compressed kernel.  Therefore:
++#   - s0 (kernel section): only the loader.uImage stub (padded, ~64k)
++#   - s1 (zldfs section):  OKLI compressed kernel + squashfs rootfs
++#
++# Flash layout after ZLD flashes the factory image:
++#   0x180000 (kernel):  [sub-header 512B] [loader.uImage]
++#   0x2A0000 (zldfs):   [OKLI kernel] [squashfs rootfs]
++#
++# The OKLI stub is compiled with LOADER_FLASH_OFFS pointing to the zldfs
++# partition start (0x2A0000), where the OKLI-magic kernel is found.
++# Build a loader uImage with load/entry = LZMA_TEXT_START instead of
++# KERNEL_LOADADDR.  Used by devices where the OKLI stub must run at the
++# address it was linked at (0x81800000) rather than the kernel load address.
++define Build/uImage-lzma-text-start
++	mkimage \
++		-A $(LINUX_KARCH) \
++		-O linux \
++		-T kernel \
++		-C lzma \
++		-a $(LZMA_TEXT_START) \
++		-e $(LZMA_TEXT_START) \
++		-n '$(call toupper,$(LINUX_KARCH)) $(VERSION_DIST) Linux-$(LINUX_VERSION)' \
++		-d $@ $@.new
 +	mv $@.new $@
++endef
++
++define Build/zyxel-deadbeaf-loader
++	dd if=$(KDIR)/loader-$(DEVICE_NAME).uImage bs=65536 conv=sync > $@.kernel_blob
++	# Pad OKLI image + squashfs to the full nor1:zldfs partition size
++	# (13632k) with 0xFF so ZLD overwrites the writable overlay region
++	# with erased flash. Without this, jffs2 mistakes leftover stock-
++	# firmware bytes for an old filesystem on first boot.
++	# Build by first generating a $(DEADBEAF_ROOTFS_SIZE)-byte 0xFF canvas,
++	# then overwriting its head with the real payload.
++	head -c $(DEADBEAF_ROOTFS_SIZE) /dev/zero | tr '\000' '\377' > $@.rootfs_blob
++	cat $(IMAGE_KERNEL) $(IMAGE_ROOTFS) | \
++		dd of=$@.rootfs_blob conv=notrunc 2>/dev/null
++	$(STAGING_DIR_HOST)/bin/mkdeadbeaf \
++		-B $(1) \
++		-k $@.kernel_blob \
++		-r $@.rootfs_blob \
++		-K $(DEADBEAF_PART_OFFS) \
++		$(if $(DEADBEAF_ROOTFS_OFFS),-R $(DEADBEAF_ROOTFS_OFFS)) \
++		$(if $(DEADBEAF_MODEL_ID),-m $(DEADBEAF_MODEL_ID)) \
++		$(if $(DEADBEAF_KERNEL_VERSION),-V "$(DEADBEAF_KERNEL_VERSION)") \
++		$(if $(DEADBEAF_ZLD_VERSION),-Z "$(DEADBEAF_ZLD_VERSION)") \
++		$(if $(DEADBEAF_BUILD_DATE),-d "$(DEADBEAF_BUILD_DATE)") \
++		-o $@
++	rm -f $@.kernel_blob $@.rootfs_blob
 +endef
 +
  
  define Device/8dev_carambola2
    SOC := ar9331
-@@ -3464,6 +3473,23 @@ define Device/zyxel_nwa1123-ni
+@@ -3464,6 +3535,58 @@ define Device/zyxel_nwa1123-ni
  endef
  TARGET_DEVICES += zyxel_nwa1123-ni
  
@@ -1127,13 +498,48 @@ index ef156dd..409e4ec 100644
 +  DEVICE_MODEL := NWA5123-AC
 +  DEVICE_PACKAGES := kmod-ath10k-ct-smallbuffers \
 +	ath10k-firmware-qca988x-ct
-+  LOADER_FLASH_OFFS := 0x180000
++  # LOADER_FLASH_OFFS: flash offset where the OKLI stub searches for the
++  # OKLI-magic kernel.  ZLD writes the rootfs section (which contains the
++  # OKLI kernel prepended to squashfs) to the zldfs partition at 0x2A0000.
++  # DEADBEAF_PART_OFFS: flash offset of the kernel partition start, written
++  # into the deadbeaf header s0.flash_offset so ZLD knows where to write
++  # the loader stub; ZLD calls bootm at 0x1e000000 + 0x180000.
++  LOADER_FLASH_OFFS := 0x2A0000
 +  LOADER_FLASH_BASE := 0x1e000000
++  LOADER_FLASH_MAX := 0x100000
++  LOADER_FLASH_CS1 := 1
++  # Zyxel ships NWA5123-AC units with bootImage=0 or bootImage=1 ex
++  # factory. ATNZ writes the inactive slot, so a bootImage=0 unit gets
++  # OpenWrt on CS1 (nor1:0x2a0000 = LOADER_FLASH_OFFS above) while a
++  # bootImage=1 unit gets it on CS0 (nor0:0x150000). Probe the CS0
++  # location first; the loader falls through to the CS1 SPI read when
++  # it doesn't find the OKLI magic there.
++  LOADER_FLASH_CS0_FALLBACK := 0x150000
++  DEADBEAF_PART_OFFS := 0x180000
++  DEADBEAF_ROOTFS_OFFS := 0x2A0000
++  DEADBEAF_ROOTFS_SIZE := 13631488
++  DEADBEAF_MODEL_ID := 0x000526e1
++  DEADBEAF_KERNEL_VERSION := $(LINUX_VERSION)
++  # ZLD identifies the rootfs section as "TYPE_LDFS" by position-sensitive
++  # match on s1.version: the format must be exactly "x.yy(###.z)" (11 chars
++  # + NUL) with the literal "###" placeholder at bytes 5..7. On flash ZLD
++  # substitutes "###" with a bootbase-hardcoded 4-char code ("AAZY" on
++  # NWA5123-AC) and writes "x.yy(AAZY.z) | DATE" into sub_hdr+0x80.
++  # 12-char variants ("99.99(###.0)") shift "###" out of the match window
++  # so ZLD reports <NULL> and leaves sub_hdr+0x80 empty, which keeps the
++  # image in "New"/"Fail" state and blocks auto-boot. "#" must be
++  # \-escaped for make.
++  DEADBEAF_ZLD_VERSION := 9.99(\#\#\#.0)
++  DEADBEAF_BUILD_DATE := $(shell date -u '+%Y-%m-%d %H:%M:%S')
++  # Override loader uImage load/entry to LZMA_TEXT_START (0x81800000) so
++  # U-Boot loads the stub at the address it was linked for. The default
++  # Build/uImage uses KERNEL_LOADADDR (0x80060000) which is wrong here.
++  COMPILE/loader-$(1).uImage := loader-okli-compile | pad-to 64k | \
++	lzma | uImage-lzma-text-start
 +  KERNEL := kernel-bin | append-dtb | lzma | uImage lzma -M 0x4f4b4c49
 +  IMAGE_SIZE := 14848k
 +  IMAGES += factory.bin
-+  IMAGE/factory.bin := append-kernel | pad-to $$$$(BLOCKSIZE) | \
-+	append-rootfs | pad-rootfs | check-size | zyxel-deadbeaf NWA5123-AC
++  IMAGE/factory.bin := zyxel-deadbeaf-loader NWA5123-AC
 +endef
 +TARGET_DEVICES += zyxel_nwa5123-ac
 +
@@ -1141,5 +547,5 @@ index ef156dd..409e4ec 100644
    SOC := qca9557
    DEVICE_VENDOR := Zyxel
 -- 
-2.43.0
+2.55.0
 
