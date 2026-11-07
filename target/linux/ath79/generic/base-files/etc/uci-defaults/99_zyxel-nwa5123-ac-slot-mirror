@@ -1,0 +1,115 @@
+#!/bin/sh
+#
+# One-shot: mirror the OKLI loader uImage into BOTH Zyxel image slots
+# (zy-image0 on CS0, zy-image1-loader on CS1) so that ZLD boots our
+# OKLI stub no matter which slot it picks on the next power-on.
+#
+# Why both slots?
+#   Zyxel ships NWA5123-AC units with the ex-factory bootImage flag at
+#   either 0 or 1. ATNZ writes the inactive slot, so:
+#     bootImage=0 unit -> OpenWrt lands on CS1 (zy-image1-loader),
+#                         CS0 (zy-image0) stays stock Zyxel
+#     bootImage=1 unit -> OpenWrt lands on CS0 (zy-image0),
+#                         CS1 (zy-image1-loader) stays stock Zyxel
+#   ZLD's auto-boot preference is sticky and bootbase's ATxx commands
+#   for flipping it are inaccessible on this device, so we can't force
+#   ZLD to boot our newly-flashed slot. The workaround is to put the
+#   OKLI stub into the OTHER slot too; the universal OKLI loader
+#   (LOADER_FLASH_CS0_FALLBACK) finds the real kernel+rootfs on
+#   whichever flash chip ZLD actually programmed.
+#
+# Idempotent: skips the write if the destination slot already carries
+# the OKLI stub, so re-running after sysupgrade/factory doesn't wear
+# the flash. Preserves everything in the destination slot beyond the
+# first 1152k (= the kernel partition) so the recovery recipe can
+# still rebuild a bootable Zyxel image from a stock dump.
+
+. /lib/functions.sh
+
+board=$(board_name)
+[ "$board" = "zyxel,nwa5123-ac" ] || exit 0
+
+OKLI_MAGIC=4f4b4c49    # 'OKLI' at offset 0 of the firmware partition
+
+log() {
+	echo "zyxel-nwa5123-ac-slot-mirror: $*" >/dev/kmsg 2>/dev/null || true
+	logger -t zyxel-nwa5123-ac-slot-mirror -- "$*" 2>/dev/null || true
+}
+
+find_mtd() {
+	sed -n "s/^\(mtd[0-9]\+\):[^\"]*\"$1\"\$/\1/p" /proc/mtd
+}
+
+magic_at() {
+	dd if="$1" bs=1 count=4 2>/dev/null | hexdump -v -e '/1 "%02x"'
+}
+
+# Loader (sub_hdr + OKLI uImage stub) slots:
+cs0_loader_part=zy-image0
+cs1_loader_part=zy-image1-loader
+# Firmware (kernel + rootfs, starts with the OKLI uImage magic) slots:
+cs0_fw_part=firmware2
+cs1_fw_part=firmware
+
+cs0_loader_mtd=$(find_mtd "$cs0_loader_part")
+cs1_loader_mtd=$(find_mtd "$cs1_loader_part")
+cs0_fw_mtd=$(find_mtd "$cs0_fw_part")
+cs1_fw_mtd=$(find_mtd "$cs1_fw_part")
+if [ -z "$cs0_loader_mtd" ] || [ -z "$cs1_loader_mtd" ] || \
+   [ -z "$cs0_fw_mtd" ] || [ -z "$cs1_fw_mtd" ]; then
+	log "mtd lookup failed (loaders: cs0=$cs0_loader_mtd cs1=$cs1_loader_mtd;" \
+	    "firmwares: cs0=$cs0_fw_mtd cs1=$cs1_fw_mtd)"
+	exit 0
+fi
+
+cs0_fw_magic=$(magic_at "/dev/$cs0_fw_mtd")
+cs1_fw_magic=$(magic_at "/dev/$cs1_fw_mtd")
+
+# Figure out where ZLD just flashed OpenWrt by checking the OKLI
+# magic at the START of each firmware partition. The matching loader
+# slot (= same chip) is the source; the other chip's loader slot is
+# the destination.
+if [ "$cs0_fw_magic" = "$OKLI_MAGIC" ] && [ "$cs1_fw_magic" = "$OKLI_MAGIC" ]; then
+	log "both firmware slots carry OpenWrt already, nothing to clone"
+	exit 0
+elif [ "$cs0_fw_magic" = "$OKLI_MAGIC" ]; then
+	src_dev=/dev/$cs0_loader_mtd
+	dst_dev=/dev/$cs1_loader_mtd
+	dst_part=$cs1_loader_part
+	log "OpenWrt lives on CS0, mirroring loader into $dst_part"
+elif [ "$cs1_fw_magic" = "$OKLI_MAGIC" ]; then
+	src_dev=/dev/$cs1_loader_mtd
+	dst_dev=/dev/$cs0_loader_mtd
+	dst_part=$cs0_loader_part
+	log "OpenWrt lives on CS1, mirroring loader into $dst_part"
+else
+	log "no OKLI magic found on either firmware slot" \
+	    "(cs0_fw=$cs0_fw_magic cs1_fw=$cs1_fw_magic)"
+	exit 0
+fi
+
+log "mirroring OKLI from $src_dev into $dst_part"
+
+tmp=$(mktemp)
+trap 'rm -f "$tmp"' EXIT
+
+# Read the destination slot in full so we preserve anything past the
+# OKLI kernel area (= the stock Zyxel zldfs bytes); overwrite only the
+# first 1152k with the source slot's OKLI stub + sub_hdr.
+if ! dd if="$dst_dev" of="$tmp" 2>/dev/null; then
+	log "read failed on $dst_dev"
+	exit 0
+fi
+if ! dd if="$src_dev" of="$tmp" bs=65536 count=18 \
+	conv=notrunc 2>/dev/null; then
+	log "src read failed on $src_dev"
+	exit 0
+fi
+
+if mtd -q write "$tmp" "$dst_part"; then
+	log "mirrored; ZLD will now boot OpenWrt regardless of bootImage flag"
+else
+	log "mtd write failed on $dst_part"
+fi
+
+exit 0
