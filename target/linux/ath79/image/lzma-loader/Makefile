@@ -17,6 +17,8 @@ KERNEL_MAGIC	:=
 TARGET_DIR	:=
 FLASH_OFFS	:=
 FLASH_MAX	:=
+FLASH_BASE	:=
+FLASH_CS1	:=
 BOARD		:=
 
 ifeq ($(TARGET_DIR),)
@@ -45,6 +47,8 @@ loader-compile: $(PKG_BUILD_DIR)/.prepared
 		KERNEL_MAGIC=$(KERNEL_MAGIC) \
 		FLASH_OFFS=$(FLASH_OFFS) \
 		FLASH_MAX=$(FLASH_MAX) \
+		FLASH_BASE=$(FLASH_BASE) \
+		FLASH_CS1=$(FLASH_CS1) \
 		BOARD="$(BOARD)" \
 		clean all
 
