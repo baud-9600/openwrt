@@ -259,8 +259,15 @@
 	gmac-config {
 		device = <&gmac>;
 		rgmii-gmac0 = <1>;
-		rxd-delay = <1>;
-		rxdv-delay = <1>;
+		/*
+		 * The AR8035 RX path is marginal with rxd/rxdv delay 1:
+		 * ~1.2% Rx FCS errors under load, which collapses TCP
+		 * throughput. Use the NWA1123-AC RX delay (3) and keep
+		 * the TX delays at their 0 default, as txd/txen delay 3
+		 * corrupts transmitted frames on this board.
+		 */
+		rxd-delay = <3>;
+		rxdv-delay = <3>;
 	};
 };
 

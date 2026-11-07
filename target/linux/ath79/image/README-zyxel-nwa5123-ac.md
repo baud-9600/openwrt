@@ -146,9 +146,10 @@ case: external SPI programmer on the SOIC-8 chip and re-flash
 
 ## Ethernet / RGMII caveat
 
-The AR8035 PHY needs careful delay handling. The combination of
-`phy-mode = "rgmii-id"` on `eth0` (MAC-side RX+TX delay) with the
-HiveAP-121-style `gmac-config` tuning is what works on this board:
+The AR8035 PHY needs careful RGMII delay handling. `phy-mode =
+"rgmii-id"` lets the PHY apply its internal delays; on top of that
+the MAC-side delays are tuned via `gmac-config`. The working
+combination is:
 
 ```dts
 &eth0 {
@@ -159,17 +160,22 @@ HiveAP-121-style `gmac-config` tuning is what works on this board:
     gmac-config {
         device = <&gmac>;
         rgmii-gmac0 = <1>;
-        rxd-delay = <1>;
-        rxdv-delay = <1>;
+        rxd-delay = <3>;
+        rxdv-delay = <3>;
     };
 };
 ```
 
-Using `rxd-delay = <3>` / `txd-delay = <3>` (as some ar9344 boards
-do) produces frames that leave the PHY corrupted — the link comes
-up at 1000M/Full but TX never reaches the switch (0 input packets
-on the trunk port, no MAC learned). Dropping the TX delays and
-reducing RX delay to `<1>` resolves it.
+With `rxd-delay`/`rxdv-delay` = `<1>` the link comes up at
+1000M/Full and TX works, but the RX path is marginal: `ethtool -S
+eth0` reports roughly 1.2% `Rx FCS Error` under load, and TCP
+collapses (small congestion window, retransmits, single-digit
+Mbit/s). Raising the RX delay to the NWA1123-AC value `<3>` samples
+the RGMII RX data later and removes those errors.
+
+Keep the TX delays at their `<0>` default. `txd-delay = <3>` /
+`txen-delay = <3>` corrupts transmitted frames on this board: the
+link comes up at 1000M/Full but no frames reach the switch.
 
 ## Mesh / batman-adv
 
