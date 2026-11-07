@@ -1,0 +1,274 @@
+// SPDX-License-Identifier: GPL-2.0-or-later OR MIT
+
+#include "ar9344.dtsi"
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/input/input.h>
+#include <dt-bindings/leds/common.h>
+#include <dt-bindings/mtd/partitions/uimage.h>
+
+/ {
+	model = "Zyxel NWA5123-AC";
+	compatible = "zyxel,nwa5123-ac", "qca,ar9344";
+
+	aliases {
+		label-mac-device = &eth0;
+		led-boot = &led_status_green;
+		led-failsafe = &led_status_amber;
+		led-running = &led_status_green;
+		led-upgrade = &led_status_amber;
+	};
+
+	leds {
+		compatible = "gpio-leds";
+
+		led_status_green: status_green {
+			function = LED_FUNCTION_STATUS;
+			color = <LED_COLOR_ID_GREEN>;
+			gpios = <&gpio 12 GPIO_ACTIVE_LOW>;
+			default-state = "on";
+		};
+
+		led_status_amber: status_amber {
+			function = LED_FUNCTION_STATUS;
+			color = <LED_COLOR_ID_AMBER>;
+			gpios = <&gpio 11 GPIO_ACTIVE_LOW>;
+		};
+	};
+
+	keys {
+		compatible = "gpio-keys";
+
+		reset {
+			label = "reset";
+			linux,code = <KEY_RESTART>;
+			gpios = <&gpio 4 GPIO_ACTIVE_LOW>;
+		};
+	};
+};
+
+&ref {
+	clock-frequency = <40000000>;
+};
+
+&spi {
+	status = "okay";
+
+	/* CS0: boot flash */
+	flash@0 {
+		compatible = "jedec,spi-nor";
+		reg = <0>;
+		spi-max-frequency = <50000000>;
+
+		partitions {
+			compatible = "fixed-partitions";
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			partition@0 {
+				label = "u-boot";
+				reg = <0x000000 0x030000>;
+				read-only;
+			};
+
+			/*
+			 * nor0:0x30000-0x150000 is the Image0 kernel slot
+			 * in Zyxel's layout. Writable so our uci-defaults
+			 * script can clone the OKLI stub into it (ZLD then
+			 * boots our loader on bootImage=0 units too).
+			 */
+			partition@30000 {
+				label = "zy-image0";
+				reg = <0x030000 0x120000>;
+			};
+
+			/*
+			 * nor0:0x150000-0xea0000 is the Image0 zldfs
+			 * slot. On units Zyxel shipped with bootImage=1
+			 * ex factory, ATNZ writes the OpenWrt uImage +
+			 * squashfs here instead of CS1. Expose it as a
+			 * uimage-fw partition so the kernel splits off a
+			 * rootfs when it finds the OKLI magic; on
+			 * bootImage=0 units it holds Zyxel's stock zldfs
+			 * (hsqs magic) and mtdsplit silently skips it.
+			 */
+			partition@150000 {
+				compatible = "openwrt,uimage", "denx,uimage";
+				openwrt,ih-magic = <IH_MAGIC_OKLI>;
+				label = "firmware2";
+				reg = <0x150000 0xd50000>;
+			};
+
+			/*
+			 * Zyxel-side partitions follow the stock layout so Linux
+			 * can read the vendor's dualimage state (zy-conf) and the
+			 * sticker MAC in myZyXEL. Writes are gated by read-only
+			 * on everything except zy-conf, where the bootImage flag
+			 * lives and OpenWrt may need to update it.
+			 *
+			 * Stock Zyxel calls these:
+			 *   0x030000-0x150000  backup_ker (= inactive-slot kernel)
+			 *   0x150000-0xea0000  backup_fs  (= inactive-slot rootfs)
+			 *   0xea0000-0xfa0000  conf
+			 *   0xfa0000-0xfb0000  myZyXEL
+			 *   0xfb0000-0xfc0000  mrd
+			 *   0xfc0000-0xff0000  disklog
+			 *   0xff0000-0x1000000 ART
+			 */
+			partition@ea0000 {
+				label = "zy-conf";
+				reg = <0xea0000 0x100000>;
+			};
+
+			partition@fa0000 {
+				label = "zy-myZyXEL";
+				reg = <0xfa0000 0x010000>;
+				read-only;
+			};
+
+			partition@fb0000 {
+				label = "zy-mrd";
+				reg = <0xfb0000 0x010000>;
+				read-only;
+
+				nvmem-layout {
+					compatible = "fixed-layout";
+					#address-cells = <1>;
+					#size-cells = <1>;
+
+					macaddr_mrd_fff8: macaddr@fff8 {
+						compatible = "mac-base";
+						reg = <0xfff8 0x6>;
+						#nvmem-cell-cells = <1>;
+					};
+				};
+			};
+
+			partition@fc0000 {
+				label = "zy-disklog";
+				reg = <0xfc0000 0x030000>;
+				read-only;
+			};
+
+			partition@ff0000 {
+				label = "art";
+				reg = <0xff0000 0x010000>;
+				read-only;
+
+				nvmem-layout {
+					compatible = "fixed-layout";
+					#address-cells = <1>;
+					#size-cells = <1>;
+
+					calibration_ath9k: calibration@1000 {
+						reg = <0x1000 0x440>;
+					};
+				};
+			};
+		};
+	};
+
+	/* CS1: firmware flash */
+	flash@1 {
+		compatible = "jedec,spi-nor";
+		reg = <1>;
+		spi-max-frequency = <50000000>;
+
+		partitions {
+			compatible = "fixed-partitions";
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			partition@0 {
+				label = "reserve";
+				reg = <0x000000 0x180000>;
+				read-only;
+			};
+
+			/*
+			 * nor1:zy-image1-loader holds the deadbeaf sub_hdr
+			 * (first 512 bytes of the first erase block)
+			 * followed by the OKLI loader uImage that ZLD
+			 * boots. Not read-only on purpose: /etc/uci-defaults
+			 * runs a one-shot script on first boot that writes
+			 * a non-empty ZLD version string into sub_hdr+0x80
+			 * so ATDS reports Image1 as "Success" instead of
+			 * "New"; ZLD zeros that field during ATNZ because
+			 * our section 1 doesn't match its TYPE_LDFS
+			 * recognition heuristic. The unique label avoids a
+			 * clash with the vestigial nor0:loader in old
+			 * layouts. Linux never mounts this partition.
+			 */
+			partition@180000 {
+				label = "zy-image1-loader";
+				reg = <0x180000 0x120000>;
+			};
+
+			/*
+			 * nor1:zldfs is the OKLI uImage followed by the
+			 * squashfs rootfs. The uimage parser finds the
+			 * OKLI magic at offset 0 and splits it into
+			 * kernel / rootfs subpartitions.
+			 */
+			partition@2a0000 {
+				compatible = "openwrt,uimage", "denx,uimage";
+				openwrt,ih-magic = <IH_MAGIC_OKLI>;
+				label = "firmware";
+				reg = <0x2a0000 0xd50000>;
+			};
+
+			partition@ff0000 {
+				label = "myZyXEL";
+				reg = <0xff0000 0x010000>;
+				read-only;
+			};
+		};
+	};
+};
+
+&pcie {
+	status = "okay";
+
+	wifi@0,0 {
+		compatible = "qcom,ath10k";
+		reg = <0x0000 0 0 0 0>;
+		nvmem-cells = <&macaddr_mrd_fff8 2>;
+		nvmem-cell-names = "mac-address";
+	};
+};
+
+&mdio0 {
+	status = "okay";
+
+	phy0: ethernet-phy@0 {
+		reg = <0>;
+	};
+};
+
+&eth0 {
+	status = "okay";
+
+	pll-data = <0x06000000 0x00000101 0x00001313>;
+
+	nvmem-cells = <&macaddr_mrd_fff8 0>;
+	nvmem-cell-names = "mac-address";
+
+	phy-mode = "rgmii-id";
+	phy-handle = <&phy0>;
+
+	gmac-config {
+		device = <&gmac>;
+		rgmii-gmac0 = <1>;
+		rxd-delay = <1>;
+		rxdv-delay = <1>;
+	};
+};
+
+&wmac {
+	status = "okay";
+
+	ieee80211-freq-limit = <2402000 2482000>;
+
+	nvmem-cells = <&macaddr_mrd_fff8 1>, <&calibration_ath9k>;
+	nvmem-cell-names = "mac-address", "calibration";
+};
