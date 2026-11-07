@@ -1,0 +1,278 @@
+From f4a47da58eccec51ebc29a8256df1917eedd34a2 Mon Sep 17 00:00:00 2001
+From: Manuel Kuklinski <mk@asdfghasdfgh.de>
+Date: Thu, 29 Oct 2026 16:43:57 +0000
+Subject: [PATCH 5/7] ath79: nwa5123-ac: fix deadbeaf header and image recipe
+
+Two bugs in the initial implementation:
+
+1. section_entry1 was 268 bytes instead of 272. The bootloader reports
+   "header_len = 652, 108, 272, 2" which equals 108 + 272*2, confirming
+   both section entries must be 272 bytes. The 4-byte delta caused data
+   misalignment and "extract fail = -5".
+
+   Unify both entries into a single struct section_entry (272 bytes).
+
+2. The factory.bin IMAGE pipeline was appending kernel+rootfs before
+   calling zyxel-deadbeaf, but the recipe constructs the deadbeaf image
+   from scratch using $(IMAGE_KERNEL) and $(IMAGE_ROOTFS) directly.
+   Simplify to: IMAGE/factory.bin := zyxel-deadbeaf NWA5123-AC
+
+   Also drop the -R (rootfs flash offset) option; mkdeadbeaf now
+   computes rootfs_offset automatically from kernel_offset + padded
+   kernel size (aligned to 64k erase block).
+
+---
+ scripts/mkdeadbeaf.c                | 104 ++++++++++++++--------------
+ target/linux/ath79/image/generic.mk |   9 ++-
+ 2 files changed, 55 insertions(+), 58 deletions(-)
+
+diff --git a/scripts/mkdeadbeaf.c b/scripts/mkdeadbeaf.c
+index 472b918..3ccc40d 100644
+--- a/scripts/mkdeadbeaf.c
++++ b/scripts/mkdeadbeaf.c
+@@ -4,7 +4,11 @@
+  *
+  * Used by: NWA5123-AC and similar Zyxel NWA access points
+  *
+- * The firmware file has a 648-byte header followed by kernel and rootfs data.
++ * Header layout (652 bytes total):
++ *   - pre-header:    108 bytes (includes magic, sizes, board, num_sections)
++ *   - section_entry: 272 bytes (kernel)
++ *   - section_entry: 272 bytes (rootfs)
++ *
+  * Checksums use MD5 word-sum: sum of 4 big-endian 32-bit words from the
+  * MD5 digest, mod 2^32 (returns 1 if result is 0).
+  *
+@@ -37,16 +41,15 @@
+ 
+ #define DEADBEAF_MAGIC		0xDEADBEAF
+ #define PRE_HEADER_SIZE		108
+-#define SECTION_ENTRY0_SIZE	272
+-#define SECTION_ENTRY1_SIZE	268
++#define SECTION_ENTRY_SIZE	272
+ #define KERNEL_SUB_HDR_SIZE	512
+-#define HEADER_SIZE		(PRE_HEADER_SIZE + SECTION_ENTRY0_SIZE + SECTION_ENTRY1_SIZE)
++#define HEADER_SIZE		(PRE_HEADER_SIZE + 2 * SECTION_ENTRY_SIZE)
+ #define FILENAME_LEN		64
+ #define PARTITION_LEN		64
++#define BLOCKSIZE		0x10000	/* 64k flash erase block */
+ 
+-/* Default flash offsets for NWA5123-AC */
++/* Default kernel flash offset for NWA5123-AC */
+ #define DEFAULT_KERNEL_OFFSET	0x00180000
+-#define DEFAULT_ROOTFS_OFFSET	0x002A0000
+ 
+ struct deadbeaf_header {
+ 	uint32_t master_crc;
+@@ -66,22 +69,13 @@ struct deadbeaf_header {
+ 	uint16_t pad2;
+ } __attribute__((packed));
+ 
+-struct section_entry0 {
++struct section_entry {
+ 	uint32_t size;
+ 	uint32_t checksum;
+ 	uint32_t flash_offset;
+ 	char     filename[FILENAME_LEN];
+ 	char     partition[PARTITION_LEN];
+-	uint8_t  pad[SECTION_ENTRY0_SIZE - 12 - FILENAME_LEN - PARTITION_LEN];
+-} __attribute__((packed));
+-
+-struct section_entry1 {
+-	uint32_t size;
+-	uint32_t checksum;
+-	uint32_t flash_offset;
+-	char     filename[FILENAME_LEN];
+-	char     partition[PARTITION_LEN];
+-	uint8_t  pad[SECTION_ENTRY1_SIZE - 12 - FILENAME_LEN - PARTITION_LEN];
++	uint8_t  pad[SECTION_ENTRY_SIZE - 12 - FILENAME_LEN - PARTITION_LEN];
+ } __attribute__((packed));
+ 
+ static const char *progname;
+@@ -156,23 +150,21 @@ static void usage(int status)
+ 		"  -o <file>      output file (required)\n"
+ 		"  -v <version>   firmware version string (default: 1.00.00)\n"
+ 		"  -K <offset>    kernel flash offset (default: 0x%x)\n"
+-		"  -R <offset>    rootfs flash offset (default: 0x%x)\n"
+ 		"  -h             show this help\n",
+-		progname, DEFAULT_KERNEL_OFFSET, DEFAULT_ROOTFS_OFFSET);
++		progname, DEFAULT_KERNEL_OFFSET);
+ 	exit(status);
+ }
+ 
+ int main(int argc, char *argv[])
+ {
+ 	struct deadbeaf_header hdr;
+-	struct section_entry0 s0;
+-	struct section_entry1 s1;
++	struct section_entry s0, s1;
+ 	uint8_t sub_hdr[KERNEL_SUB_HDR_SIZE];
+ 	const char *board = NULL, *kernel_path = NULL;
+ 	const char *rootfs_path = NULL, *output_path = NULL;
+ 	const char *version = "1.00.00";
+ 	uint32_t kernel_offset = DEFAULT_KERNEL_OFFSET;
+-	uint32_t rootfs_offset = DEFAULT_ROOTFS_OFFSET;
++	uint32_t rootfs_offset;
+ 	void *kernel_data, *rootfs_data, *file_buf;
+ 	size_t kernel_size, rootfs_size, file_size;
+ 	char name_buf[FILENAME_LEN];
+@@ -181,7 +173,7 @@ int main(int argc, char *argv[])
+ 
+ 	progname = argv[0];
+ 
+-	while ((opt = getopt(argc, argv, "B:k:r:o:v:K:R:h")) != -1) {
++	while ((opt = getopt(argc, argv, "B:k:r:o:v:K:h")) != -1) {
+ 		switch (opt) {
+ 		case 'B':
+ 			board = optarg;
+@@ -201,9 +193,6 @@ int main(int argc, char *argv[])
+ 		case 'K':
+ 			kernel_offset = strtoul(optarg, NULL, 0);
+ 			break;
+-		case 'R':
+-			rootfs_offset = strtoul(optarg, NULL, 0);
+-			break;
+ 		case 'h':
+ 			usage(0);
+ 		default:
+@@ -224,32 +213,37 @@ int main(int argc, char *argv[])
+ 	if (!rootfs_data)
+ 		return 1;
+ 
+-	/* Section 0 includes 512-byte sub-header + kernel */
++	/* Rootfs follows kernel on flash, aligned to erase block */
++	rootfs_offset = kernel_offset +
++		((kernel_size + KERNEL_SUB_HDR_SIZE + BLOCKSIZE - 1) /
++		 BLOCKSIZE) * BLOCKSIZE;
++
++	/* Total file: header + 512-byte sub-header + kernel + rootfs */
+ 	file_size = HEADER_SIZE + KERNEL_SUB_HDR_SIZE + kernel_size + rootfs_size;
+ 
+ 	/* Build pre-header */
+ 	memset(&hdr, 0, sizeof(hdr));
+-	hdr.master_crc = 0; /* placeholder */
+-	hdr.magic = cpu_to_be32(DEADBEAF_MAGIC);
+-	hdr.type = cpu_to_be32(0x01000002);
+-	hdr.model_id = 0;
+-	hdr.reserved1 = cpu_to_be32(0xFFFFFFFF);
+-	hdr.reserved2 = cpu_to_be32(0xFFFFFFFF);
+-	hdr.file_size = cpu_to_be32(file_size);
+-	hdr.header_size = cpu_to_be16(HEADER_SIZE);
++	hdr.master_crc    = 0; /* filled below */
++	hdr.magic         = cpu_to_be32(DEADBEAF_MAGIC);
++	hdr.type          = cpu_to_be32(0x01000002);
++	hdr.model_id      = 0;
++	hdr.reserved1     = cpu_to_be32(0xFFFFFFFF);
++	hdr.reserved2     = cpu_to_be32(0xFFFFFFFF);
++	hdr.file_size     = cpu_to_be32(file_size);
++	hdr.header_size   = cpu_to_be16(HEADER_SIZE);
+ 	hdr.pre_header_size = cpu_to_be16(PRE_HEADER_SIZE);
+-	hdr.flags = cpu_to_be32(0x01100000);
++	hdr.flags         = cpu_to_be32(0x01100000);
+ 	strncpy(hdr.version, version, sizeof(hdr.version) - 1);
+ 	strncpy(hdr.board, board, sizeof(hdr.board) - 1);
+-	hdr.num_sections = cpu_to_be16(2);
++	hdr.num_sections  = cpu_to_be16(2);
+ 
+ 	/* Build section entry 0 (kernel) */
+ 	memset(&s0, 0, sizeof(s0));
+-	s0.size = cpu_to_be32(KERNEL_SUB_HDR_SIZE + kernel_size);
+-	s0.checksum = cpu_to_be32(md5ws(kernel_data, kernel_size));
++	s0.size         = cpu_to_be32(KERNEL_SUB_HDR_SIZE + kernel_size);
++	s0.checksum     = cpu_to_be32(md5ws(kernel_data, kernel_size));
+ 	s0.flash_offset = cpu_to_be32(kernel_offset);
+ 
+-	/* Build filename: "kernel<board_lowercase>.bin" */
++	/* filename: "kernel<board_lowercase>.bin" */
+ 	memset(name_buf, 0, sizeof(name_buf));
+ 	snprintf(name_buf, sizeof(name_buf), "kernel");
+ 	i = strlen(name_buf);
+@@ -263,16 +257,16 @@ int main(int argc, char *argv[])
+ 
+ 	/* Build section entry 1 (rootfs) */
+ 	memset(&s1, 0, sizeof(s1));
+-	s1.size = cpu_to_be32(rootfs_size);
+-	s1.checksum = cpu_to_be32(md5ws(rootfs_data, rootfs_size));
++	s1.size         = cpu_to_be32(rootfs_size);
++	s1.checksum     = cpu_to_be32(md5ws(rootfs_data, rootfs_size));
+ 	s1.flash_offset = cpu_to_be32(rootfs_offset);
+ 	strncpy(s1.filename, "squashfs_ro.img", FILENAME_LEN - 1);
+ 	strncpy(s1.partition, "zldfs", PARTITION_LEN - 1);
+ 
+-	/* Kernel sub-header is all zeros for OpenWrt images */
++	/* Kernel sub-header: all zeros */
+ 	memset(sub_hdr, 0, sizeof(sub_hdr));
+ 
+-	/* Assemble the complete file in memory for master checksum */
++	/* Assemble complete file for master checksum */
+ 	file_buf = malloc(file_size);
+ 	if (!file_buf) {
+ 		fprintf(stderr, "%s: malloc(%zu) failed\n", progname, file_size);
+@@ -280,15 +274,16 @@ int main(int argc, char *argv[])
+ 	}
+ 
+ 	memcpy(file_buf, &hdr, sizeof(hdr));
+-	memcpy(file_buf + PRE_HEADER_SIZE, &s0, sizeof(s0));
+-	memcpy(file_buf + PRE_HEADER_SIZE + SECTION_ENTRY0_SIZE, &s1, sizeof(s1));
+-	memcpy(file_buf + HEADER_SIZE, sub_hdr, sizeof(sub_hdr));
+-	memcpy(file_buf + HEADER_SIZE + KERNEL_SUB_HDR_SIZE,
++	memcpy((uint8_t *)file_buf + PRE_HEADER_SIZE, &s0, sizeof(s0));
++	memcpy((uint8_t *)file_buf + PRE_HEADER_SIZE + SECTION_ENTRY_SIZE,
++	       &s1, sizeof(s1));
++	memcpy((uint8_t *)file_buf + HEADER_SIZE, sub_hdr, sizeof(sub_hdr));
++	memcpy((uint8_t *)file_buf + HEADER_SIZE + KERNEL_SUB_HDR_SIZE,
+ 	       kernel_data, kernel_size);
+-	memcpy(file_buf + HEADER_SIZE + KERNEL_SUB_HDR_SIZE + kernel_size,
+-	       rootfs_data, rootfs_size);
++	memcpy((uint8_t *)file_buf + HEADER_SIZE + KERNEL_SUB_HDR_SIZE +
++	       kernel_size, rootfs_data, rootfs_size);
+ 
+-	/* Compute master checksum: md5ws(file[4:]) */
++	/* Master checksum: md5ws(file[4:]) */
+ 	{
+ 		uint32_t master = md5ws((uint8_t *)file_buf + 4, file_size - 4);
+ 		((struct deadbeaf_header *)file_buf)->master_crc =
+@@ -314,8 +309,11 @@ int main(int argc, char *argv[])
+ 	free(kernel_data);
+ 	free(rootfs_data);
+ 
+-	fprintf(stderr, "%s: %s kernel=%zu rootfs=%zu total=%zu\n",
+-		progname, board, kernel_size, rootfs_size, file_size);
++	fprintf(stderr,
++		"%s: %s kernel=%zu rootfs=%zu total=%zu "
++		"kernel_off=0x%x rootfs_off=0x%x\n",
++		progname, board, kernel_size, rootfs_size, file_size,
++		kernel_offset, rootfs_offset);
+ 
+ 	return 0;
+ }
+diff --git a/target/linux/ath79/image/generic.mk b/target/linux/ath79/image/generic.mk
+index 409e4ec..59a0295 100644
+--- a/target/linux/ath79/image/generic.mk
++++ b/target/linux/ath79/image/generic.mk
+@@ -173,9 +173,9 @@ define Build/zyxel-deadbeaf
+ 	$(STAGING_DIR_HOST)/bin/mkdeadbeaf \
+ 		-B $(1) \
+ 		-k $(IMAGE_KERNEL) \
+-		-r $@ \
+-		-o $@.new
+-	mv $@.new $@
++		-r $(IMAGE_ROOTFS) \
++		-K $(LOADER_FLASH_OFFS) \
++		-o $@
+ endef
+ 
+ 
+@@ -3485,8 +3485,7 @@ define Device/zyxel_nwa5123-ac
+   KERNEL := kernel-bin | append-dtb | lzma | uImage lzma -M 0x4f4b4c49
+   IMAGE_SIZE := 14848k
+   IMAGES += factory.bin
+-  IMAGE/factory.bin := append-kernel | pad-to $$$$(BLOCKSIZE) | \
+-	append-rootfs | pad-rootfs | check-size | zyxel-deadbeaf NWA5123-AC
++  IMAGE/factory.bin := zyxel-deadbeaf NWA5123-AC
+ endef
+ TARGET_DEVICES += zyxel_nwa5123-ac
+ 
+-- 
+2.43.0
+

@@ -1,0 +1,45 @@
+From d90ce50db3a999de0ac404fe0f7e9dc58247ebae Mon Sep 17 00:00:00 2001
+From: Manuel Kuklinski <mk@asdfghasdfgh.de>
+Date: Thu, 29 Oct 2026 15:12:43 +0000
+Subject: [PATCH 2/7] ath79: image: pass LOADER_FLASH_BASE to lzma-loader
+
+Add LOADER_FLASH_BASE to DEVICE_VARS and pass it through
+Build/loader-okli-compile so devices can set the SPI flash
+base address for the OKLI kernel scanner.
+
+---
+ target/linux/ath79/image/Makefile | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/target/linux/ath79/image/Makefile b/target/linux/ath79/image/Makefile
+index 572da8c..2786135 100644
+--- a/target/linux/ath79/image/Makefile
++++ b/target/linux/ath79/image/Makefile
+@@ -3,7 +3,7 @@ include $(INCLUDE_DIR)/image.mk
+ 
+ KERNEL_LOADADDR = 0x80060000
+ 
+-DEVICE_VARS += LOADER_FLASH_OFFS LOADER_TYPE
++DEVICE_VARS += LOADER_FLASH_OFFS LOADER_FLASH_BASE LOADER_TYPE
+ DEVICE_VARS += LOADER_FLASH_MAX LOADER_KERNEL_MAGIC LZMA_TEXT_START
+ DEVICE_VARS += NETGEAR_BOARD_ID NETGEAR_HW_ID
+ DEVICE_VARS += RAS_BOARD RAS_ROOTFS_SIZE RAS_VERSION
+@@ -30,6 +30,7 @@ define Build/loader-okli-compile
+ 	$(call Build/loader-common, \
+ 		FLASH_OFFS=$(LOADER_FLASH_OFFS) \
+ 		FLASH_MAX=$(LOADER_FLASH_MAX) \
++		FLASH_BASE=$(LOADER_FLASH_BASE) \
+ 		KERNEL_MAGIC=$(LOADER_KERNEL_MAGIC) \
+ 		BOARD="$(DEVICE_NAME)" )
+ endef
+@@ -78,6 +79,7 @@ endif
+   LOADER_KERNEL_MAGIC :=
+   LOADER_FLASH_MAX :=
+   LOADER_FLASH_OFFS :=
++  LOADER_FLASH_BASE :=
+   LOADER_TYPE :=
+   LZMA_TEXT_START := 0x81800000
+   COMPILE :=
+-- 
+2.43.0
+
