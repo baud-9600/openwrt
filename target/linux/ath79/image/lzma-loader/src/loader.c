@@ -288,31 +288,86 @@ static void lzma_init_data(void)
 		 * Some units (e.g. Zyxel NWA5123-AC with bootImage=1 ex
 		 * factory) end up with the OpenWrt payload on CS0 instead
 		 * of CS1 after ATNZ, because ZLD writes the inactive slot
-		 * and that slot sits on the opposite flash. Probe CS0
-		 * memory-mapped first, fall back to CS1 if nothing matches.
+		 * and that slot sits on the opposite flash.
+		 *
+		 * After an update both chips may carry a valid uImage: the
+		 * new image is written to the inactive slot while the old
+		 * one is still on the active slot, and ZLD's bootImage flag
+		 * is sticky. Probe both slots and boot the uImage with the
+		 * newer creation timestamp (ih_time), so a freshly flashed
+		 * slot wins regardless of which chip ZLD picked.
 		 */
 		{
 			unsigned char *cs0 = (unsigned char *)
 				KSEG1ADDR(0x1f000000 + CONFIG_FLASH_CS0_FALLBACK);
-			unsigned long cs0_magic = get_be32(cs0);
+			unsigned char *cs1 = buf;
+			unsigned long cs0_time = 0, cs1_time = 0;
+			int cs0_valid = 0, cs1_valid = 0;
+
+			magic = get_be32(cs0);
 #ifdef CONFIG_KERNEL_MAGIC
-			if (cs0_magic == CONFIG_KERNEL_MAGIC) {
+			if (magic == CONFIG_KERNEL_MAGIC) {
 #else
-			if (cs0_magic == IH_MAGIC_OKLI) {
+			if (magic == IH_MAGIC_OKLI) {
 #endif
+				cs0_valid = 1;
+				cs0_time = get_be32(cs0 +
+					offsetof(struct image_header, ih_time));
+			}
+
+			cs1_read(CONFIG_FLASH_OFFS, cs1,
+				 sizeof(struct image_header));
+			magic = get_be32(cs1);
+#ifdef CONFIG_KERNEL_MAGIC
+			if (magic == CONFIG_KERNEL_MAGIC) {
+#else
+			if (magic == IH_MAGIC_OKLI) {
+#endif
+				cs1_valid = 1;
+				cs1_time = get_be32(cs1 +
+					offsetof(struct image_header, ih_time));
+			}
+
+			if (cs1_valid && (!cs0_valid || cs1_time > cs0_time)) {
+				hdr = (struct image_header *) cs1;
+				hdr_size = sizeof(struct image_header);
+				kernel_size = get_be32(&hdr->ih_size);
+				kernel_la = get_be32(&hdr->ih_load);
+
+				printf("found @cs1+%08x, size=%u, time=%u\n",
+				       (unsigned)CONFIG_FLASH_OFFS,
+				       (unsigned)kernel_size,
+				       (unsigned)cs1_time);
+
+				cs1_read(CONFIG_FLASH_OFFS + hdr_size,
+					 buf + hdr_size, kernel_size);
+
+				lzma_data = buf + hdr_size;
+				lzma_datasize = kernel_size;
+				return;
+			}
+
+			if (cs0_valid) {
 				hdr = (struct image_header *) cs0;
 				kernel_size = get_be32(&hdr->ih_size);
 				kernel_la = get_be32(&hdr->ih_load);
-				printf("found @cs0+%08x, size=%u\n",
+
+				printf("found @cs0+%08x, size=%u, time=%u\n",
 				       (unsigned)CONFIG_FLASH_CS0_FALLBACK,
-				       (unsigned)kernel_size);
+				       (unsigned)kernel_size,
+				       (unsigned)cs0_time);
+
 				lzma_data = cs0 + sizeof(struct image_header);
 				lzma_datasize = kernel_size;
 				return;
 			}
-		}
-#endif /* CONFIG_FLASH_CS0_FALLBACK */
 
+			printf("not found! @cs0+%08x / @cs1+%08x\n",
+			       (unsigned)CONFIG_FLASH_CS0_FALLBACK,
+			       (unsigned)CONFIG_FLASH_OFFS);
+			halt();
+		}
+#else /* !CONFIG_FLASH_CS0_FALLBACK */
 		cs1_read(CONFIG_FLASH_OFFS, buf, sizeof(struct image_header));
 		magic = get_be32(buf);
 #ifdef CONFIG_KERNEL_MAGIC
@@ -339,6 +394,7 @@ static void lzma_init_data(void)
 		lzma_data = buf + hdr_size;
 		lzma_datasize = kernel_size;
 		return;
+#endif /* CONFIG_FLASH_CS0_FALLBACK */
 	}
 #endif
 

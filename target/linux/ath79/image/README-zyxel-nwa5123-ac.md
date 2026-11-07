@@ -68,18 +68,20 @@ Because ATNZ writes to the *inactive* slot:
 
 To make a single factory.bin work for both:
 
-1. **Universal OKLI loader** — the stub probes CS0's memory-mapped
-   region first (`LOADER_FLASH_CS0_FALLBACK=0x150000`); if it finds
-   the OKLI uImage magic there, it boots from CS0, otherwise it
-   falls back to SPI reads on CS1 at `0x2A0000`. One binary covers
-   both ex-factory flag values.
+1. **Universal OKLI loader** — the stub probes both chips: CS0's
+   memory-mapped `firmware2` (`LOADER_FLASH_CS0_FALLBACK=0x150000`)
+   and CS1's `firmware` (`LOADER_FLASH_OFFS=0x2A0000`, read via SPI).
+   It compares the uImage `ih_time` of both and boots the newer one;
+   if only one slot carries a valid OKLI uImage, that one is used.
+   This makes a freshly flashed (inactive) slot win regardless of the
+   sticky `bootImage` flag.
 2. **Slot-mirror on first boot** — the uci-defaults script
-   `99_zyxel-nwa5123-ac-slot-mirror` detects where ZLD actually
-   flashed OpenWrt (OKLI magic at offset 0 of `firmware` or
-   `firmware2`), clones the OKLI stub into the *other* slot's loader
-   partition, and preserves everything beyond the first 1152 KiB.
-   After that both slots carry our OKLI stub; whichever slot ZLD
-   picks on the next power-on boots OpenWrt.
+   `99_zyxel-nwa5123-ac-slot-mirror` detects which firmware slot has
+   the newer uImage (or the only OKLI slot), clones that slot's
+   loader stub into the *other* loader partition, and preserves
+   everything beyond the first 1152 KiB. After that both chips run
+   the same slot-selection logic; whichever slot ZLD picks on the
+   next power-on boots the newer OpenWrt image.
 3. **firmware2 partition on CS0** — the DT exposes `zy-image0`'s
    rootfs area as a second `openwrt,uimage` partition with
    `IH_MAGIC_OKLI`. On a `bootImage=1` unit, mtdsplit finds the OKLI
@@ -249,6 +251,6 @@ option reassociation_deadline '20000'
 |------|--------------|
 | `target/linux/ath79/dts/ar9344_zyxel_nwa5123-ac.dts` | DT: dual-chip partition table, `firmware2` on CS0, MAC/calibration nvmem, LEDs, keys, AR8035 RGMII delays |
 | `target/linux/ath79/image/generic.mk` (search `zyxel_nwa5123`) | Build recipe: deadbeaf wrapper, universal OKLI loader (CS0 fallback + CS1), factory.bin |
-| `target/linux/ath79/image/lzma-loader/src/loader.c` (`CONFIG_FLASH_CS1`, `CONFIG_FLASH_CS0_FALLBACK`) | OKLI stub: probe CS0 memory-mapped, fall back to CS1 SPI |
+| `target/linux/ath79/image/lzma-loader/src/loader.c` (`CONFIG_FLASH_CS1`, `CONFIG_FLASH_CS0_FALLBACK`) | OKLI stub: probe both slots, boot the newer uImage by `ih_time` |
 | `tools/firmware-utils/patches/100-add-mkdeadbeaf.patch` | Host tool that builds the deadbeaf image ZLD will accept |
-| `target/linux/ath79/generic/base-files/etc/uci-defaults/99_zyxel-nwa5123-ac-slot-mirror` | One-shot: clones OKLI stub into the other loader slot on first boot |
+| `target/linux/ath79/generic/base-files/etc/uci-defaults/99_zyxel-nwa5123-ac-slot-mirror` | One-shot: clones the newer slot's loader stub into the other loader slot |

@@ -13,16 +13,16 @@
 #                         CS1 (zy-image1-loader) stays stock Zyxel
 #   ZLD's auto-boot preference is sticky and bootbase's ATxx commands
 #   for flipping it are inaccessible on this device, so we can't force
-#   ZLD to boot our newly-flashed slot. The workaround is to put the
-#   OKLI stub into the OTHER slot too; the universal OKLI loader
-#   (LOADER_FLASH_CS0_FALLBACK) finds the real kernel+rootfs on
-#   whichever flash chip ZLD actually programmed.
+#   ZLD to boot our newly-flashed slot. The universal OKLI loader
+#   (LOADER_FLASH_CS0_FALLBACK) therefore probes both chips and boots
+#   the uImage with the newer ih_time timestamp, which is the slot
+#   ATNZ wrote last. This script mirrors that newer slot's loader stub
+#   into the other loader slot, so both chips run the same
+#   slot-selection logic after an update.
 #
-# Idempotent: skips the write if the destination slot already carries
-# the OKLI stub, so re-running after sysupgrade/factory doesn't wear
-# the flash. Preserves everything in the destination slot beyond the
-# first 1152k (= the kernel partition) so the recovery recipe can
-# still rebuild a bootable Zyxel image from a stock dump.
+# Preserves everything in the destination slot beyond the first 1152k
+# (= the kernel partition) so the recovery recipe can still rebuild a
+# bootable Zyxel image from a stock dump.
 
 . /lib/functions.sh
 
@@ -42,6 +42,11 @@ find_mtd() {
 
 magic_at() {
 	dd if="$1" bs=1 count=4 2>/dev/null | hexdump -v -e '/1 "%02x"'
+}
+
+# uImage creation timestamp (ih_time, big-endian, offset 8)
+time_at() {
+	dd if="$1" bs=1 skip=8 count=4 2>/dev/null | hexdump -v -e '/1 "%02x"'
 }
 
 # Loader (sub_hdr + OKLI uImage stub) slots:
@@ -64,14 +69,30 @@ fi
 
 cs0_fw_magic=$(magic_at "/dev/$cs0_fw_mtd")
 cs1_fw_magic=$(magic_at "/dev/$cs1_fw_mtd")
+cs0_fw_time=$(time_at "/dev/$cs0_fw_mtd")
+cs1_fw_time=$(time_at "/dev/$cs1_fw_mtd")
 
-# Figure out where ZLD just flashed OpenWrt by checking the OKLI
-# magic at the START of each firmware partition. The matching loader
-# slot (= same chip) is the source; the other chip's loader slot is
-# the destination.
+[ -n "$cs0_fw_time" ] || cs0_fw_time=00000000
+[ -n "$cs1_fw_time" ] || cs1_fw_time=00000000
+
+# Decide which loader stub to mirror. When both firmware slots carry
+# OpenWrt, the uImage with the newer ih_time is the one ATNZ wrote
+# last; its loader stub contains the matching slot-selection logic.
 if [ "$cs0_fw_magic" = "$OKLI_MAGIC" ] && [ "$cs1_fw_magic" = "$OKLI_MAGIC" ]; then
-	log "both firmware slots carry OpenWrt already, nothing to clone"
-	exit 0
+	if [ $((0x$cs1_fw_time)) -gt $((0x$cs0_fw_time)) ]; then
+		src_dev=/dev/$cs1_loader_mtd
+		dst_dev=/dev/$cs0_loader_mtd
+		dst_part=$cs0_loader_part
+		log "newer image on CS1 ($cs1_fw_time > $cs0_fw_time), mirroring loader into $dst_part"
+	elif [ $((0x$cs0_fw_time)) -gt $((0x$cs1_fw_time)) ]; then
+		src_dev=/dev/$cs0_loader_mtd
+		dst_dev=/dev/$cs1_loader_mtd
+		dst_part=$cs1_loader_part
+		log "newer image on CS0 ($cs0_fw_time > $cs1_fw_time), mirroring loader into $dst_part"
+	else
+		log "both firmware slots carry OpenWrt with the same timestamp, nothing to clone"
+		exit 0
+	fi
 elif [ "$cs0_fw_magic" = "$OKLI_MAGIC" ]; then
 	src_dev=/dev/$cs0_loader_mtd
 	dst_dev=/dev/$cs1_loader_mtd
