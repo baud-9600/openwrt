@@ -236,9 +236,17 @@ option reassociation_deadline '20000'
   extracted verbatim from a stock `610AAZY8C0.bin` and includes
   the device's model_id (0x000526E1) and bootbase pointer values.
   Other Zyxel NWA models would need their own templates.
-- **sysupgrade not plumbed end-to-end.** `IMAGE/sysupgrade.bin` is
-  produced, but the upgrade path hasn't been exercised in anger.
-  For firmware updates, UART + ATNZ remains the reliable path.
+- **Sysupgrade writes the CS0 slot (`firmware2`).** The kernel has no
+  `root=` argument and always mounts the first `rootfs` partition
+  (mtd4, the CS0 `firmware2` slot), so the platform upgrade script
+  targets `firmware2` for this board. This keeps kernel and rootfs on
+  the same chip and makes CLI/WebUI sysupgrade work without manual
+  `PART_NAME` tweaks. The kernel uImage `ih_time` must differ between
+  slots for the timestamp loader to pick a slot; rebuild the kernel
+  (`make target/linux/clean`) or set `UIMAGE_TIME` if two builds would
+  otherwise get the same timestamp. A full dual-slot layout would need
+  the loader to pass `root=/dev/mtdblock4` (CS0) or `/dev/mtdblock15`
+  (CS1) depending on the chosen slot.
 - **Zyxel's ZLD version string on flash is cosmetic only.** `ATDS`
   always shows the stock bootbase version; it is not rewritten by
   this port, and ZLD does not consult it at boot time.
@@ -253,4 +261,5 @@ option reassociation_deadline '20000'
 | `target/linux/ath79/image/generic.mk` (search `zyxel_nwa5123`) | Build recipe: deadbeaf wrapper, universal OKLI loader (CS0 fallback + CS1), factory.bin |
 | `target/linux/ath79/image/lzma-loader/src/loader.c` (`CONFIG_FLASH_CS1`, `CONFIG_FLASH_CS0_FALLBACK`) | OKLI stub: probe both slots, boot the newer uImage by `ih_time` |
 | `tools/firmware-utils/patches/100-add-mkdeadbeaf.patch` | Host tool that builds the deadbeaf image ZLD will accept |
+| `target/linux/ath79/generic/base-files/lib/upgrade/platform.sh` | `zyxel,nwa5123-ac` case: sysupgrade write target `firmware2` (CS0) |
 | `target/linux/ath79/generic/base-files/etc/uci-defaults/99_zyxel-nwa5123-ac-slot-mirror` | One-shot: clones the newer slot's loader stub into the other loader slot |

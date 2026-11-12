@@ -124,6 +124,14 @@ platform_do_upgrade() {
 	ubnt,routerstation-pro)
 		platform_do_upgrade_redboot_fis "$1" kernel
 		;;
+	zyxel,nwa5123-ac)
+		# The kernel has no root= argument and always mounts the
+		# first rootfs partition (mtd4, the CS0 firmware2 slot), so
+		# write the upgrade to that slot to keep kernel and rootfs
+		# on the same chip.
+		PART_NAME="firmware2"
+		default_do_upgrade "$1"
+		;;
 	*)
 		default_do_upgrade "$1"
 		;;
