@@ -125,11 +125,14 @@ platform_do_upgrade() {
 		platform_do_upgrade_redboot_fis "$1" kernel
 		;;
 	zyxel,nwa5123-ac)
-		# The kernel has no root= argument and always mounts the
-		# first rootfs partition (mtd4, the CS0 firmware2 slot), so
-		# write the upgrade to that slot to keep kernel and rootfs
-		# on the same chip.
-		PART_NAME="firmware2"
+		# The OKLI loader passes root=/dev/mtdblock4 (CS0) or
+		# /dev/mtdblock15 (CS1) depending on the slot it booted, so
+		# write the image to the other (inactive) slot.
+		case "$(cat /proc/cmdline)" in
+		*root=/dev/mtdblock4*) PART_NAME="firmware" ;;
+		*root=/dev/mtdblock15*) PART_NAME="firmware2" ;;
+		*) PART_NAME="firmware2" ;;
+		esac
 		default_do_upgrade "$1"
 		;;
 	*)

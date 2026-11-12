@@ -159,6 +159,7 @@ static unsigned char *lzma_data;
 static unsigned long lzma_datasize;
 static unsigned long lzma_outsize;
 static unsigned long kernel_la;
+static unsigned long kernel_rootfs_mtd;
 
 #ifdef CONFIG_KERNEL_CMDLINE
 #define kernel_argc	2
@@ -344,6 +345,7 @@ static void lzma_init_data(void)
 
 				lzma_data = buf + hdr_size;
 				lzma_datasize = kernel_size;
+				kernel_rootfs_mtd = 15;
 				return;
 			}
 
@@ -359,6 +361,7 @@ static void lzma_init_data(void)
 
 				lzma_data = cs0 + sizeof(struct image_header);
 				lzma_datasize = kernel_size;
+				kernel_rootfs_mtd = 4;
 				return;
 			}
 
@@ -473,7 +476,32 @@ void loader_main(unsigned long reg_a0, unsigned long reg_a1,
 
 	printf("Starting kernel at %08x...\n\n", kernel_la);
 
-#ifdef CONFIG_KERNEL_CMDLINE
+#ifdef CONFIG_FLASH_CS0_FALLBACK
+	/*
+	 * The kernel has no root= argument of its own and would always
+	 * mount the first rootfs partition (mtd4, CS0). Pass the rootfs
+	 * MTD of the slot the loader just picked so kernel and rootfs
+	 * stay on the same flash chip.
+	 */
+	{
+		static const char *const argv_cs0[] = {
+			NULL,
+			"console=ttyS0,115200 root=/dev/mtdblock4 rootfstype=squashfs,jffs2",
+			NULL,
+		};
+		static const char *const argv_cs1[] = {
+			NULL,
+			"console=ttyS0,115200 root=/dev/mtdblock15 rootfstype=squashfs,jffs2",
+			NULL,
+		};
+
+		reg_a0 = 2;
+		reg_a1 = (unsigned long)
+			(kernel_rootfs_mtd == 15 ? argv_cs1 : argv_cs0);
+		reg_a2 = 0;
+		reg_a3 = 0;
+	}
+#elif defined(CONFIG_KERNEL_CMDLINE)
 	reg_a0 = kernel_argc;
 	reg_a1 = (unsigned long) kernel_argv;
 	reg_a2 = 0;
