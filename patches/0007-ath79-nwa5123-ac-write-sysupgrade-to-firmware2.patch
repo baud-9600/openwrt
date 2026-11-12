@@ -1,0 +1,66 @@
+From 9b5f96bf766f4d90a601f71657c4d0fe2330fbfc Mon Sep 17 00:00:00 2001
+From: Manuel Kuklinski <mk@asdfghasdfgh.de>
+Date: Thu, 12 Nov 2026 20:53:04 +0100
+Subject: [PATCH] ath79: nwa5123-ac: write sysupgrade to firmware2
+
+The kernel has no root= argument and always mounts the first rootfs partition (mtd4, the CS0 firmware2 slot). The default ath79 upgrade path writes the sysupgrade image to "firmware" (CS1), which leaves the new rootfs unused because the kernel keeps mounting CS0.
+
+Add a board-specific case that targets firmware2, so CLI/WebUI sysupgrade keeps kernel and rootfs on the same chip. Document the CS0 strategy and the ih_time caveat in the device README.
+---
+ .../generic/base-files/lib/upgrade/platform.sh    |  8 ++++++++
+ .../linux/ath79/image/README-zyxel-nwa5123-ac.md  | 15 ++++++++++++---
+ 2 files changed, 20 insertions(+), 3 deletions(-)
+
+diff --git a/target/linux/ath79/generic/base-files/lib/upgrade/platform.sh b/target/linux/ath79/generic/base-files/lib/upgrade/platform.sh
+index 77a80868d2..6fbc8179f2 100644
+--- a/target/linux/ath79/generic/base-files/lib/upgrade/platform.sh
++++ b/target/linux/ath79/generic/base-files/lib/upgrade/platform.sh
+@@ -124,6 +124,14 @@ platform_do_upgrade() {
+ 	ubnt,routerstation-pro)
+ 		platform_do_upgrade_redboot_fis "$1" kernel
+ 		;;
++	zyxel,nwa5123-ac)
++		# The kernel has no root= argument and always mounts the
++		# first rootfs partition (mtd4, the CS0 firmware2 slot), so
++		# write the upgrade to that slot to keep kernel and rootfs
++		# on the same chip.
++		PART_NAME="firmware2"
++		default_do_upgrade "$1"
++		;;
+ 	*)
+ 		default_do_upgrade "$1"
+ 		;;
+diff --git a/target/linux/ath79/image/README-zyxel-nwa5123-ac.md b/target/linux/ath79/image/README-zyxel-nwa5123-ac.md
+index fb18af5cab..ae55351044 100644
+--- a/target/linux/ath79/image/README-zyxel-nwa5123-ac.md
++++ b/target/linux/ath79/image/README-zyxel-nwa5123-ac.md
+@@ -236,9 +236,17 @@ option reassociation_deadline '20000'
+   extracted verbatim from a stock `610AAZY8C0.bin` and includes
+   the device's model_id (0x000526E1) and bootbase pointer values.
+   Other Zyxel NWA models would need their own templates.
+-- **sysupgrade not plumbed end-to-end.** `IMAGE/sysupgrade.bin` is
+-  produced, but the upgrade path hasn't been exercised in anger.
+-  For firmware updates, UART + ATNZ remains the reliable path.
++- **Sysupgrade writes the CS0 slot (`firmware2`).** The kernel has no
++  `root=` argument and always mounts the first `rootfs` partition
++  (mtd4, the CS0 `firmware2` slot), so the platform upgrade script
++  targets `firmware2` for this board. This keeps kernel and rootfs on
++  the same chip and makes CLI/WebUI sysupgrade work without manual
++  `PART_NAME` tweaks. The kernel uImage `ih_time` must differ between
++  slots for the timestamp loader to pick a slot; rebuild the kernel
++  (`make target/linux/clean`) or set `UIMAGE_TIME` if two builds would
++  otherwise get the same timestamp. A full dual-slot layout would need
++  the loader to pass `root=/dev/mtdblock4` (CS0) or `/dev/mtdblock15`
++  (CS1) depending on the chosen slot.
+ - **Zyxel's ZLD version string on flash is cosmetic only.** `ATDS`
+   always shows the stock bootbase version; it is not rewritten by
+   this port, and ZLD does not consult it at boot time.
+@@ -253,4 +261,5 @@ option reassociation_deadline '20000'
+ | `target/linux/ath79/image/generic.mk` (search `zyxel_nwa5123`) | Build recipe: deadbeaf wrapper, universal OKLI loader (CS0 fallback + CS1), factory.bin |
+ | `target/linux/ath79/image/lzma-loader/src/loader.c` (`CONFIG_FLASH_CS1`, `CONFIG_FLASH_CS0_FALLBACK`) | OKLI stub: probe both slots, boot the newer uImage by `ih_time` |
+ | `tools/firmware-utils/patches/100-add-mkdeadbeaf.patch` | Host tool that builds the deadbeaf image ZLD will accept |
++| `target/linux/ath79/generic/base-files/lib/upgrade/platform.sh` | `zyxel,nwa5123-ac` case: sysupgrade write target `firmware2` (CS0) |
+ | `target/linux/ath79/generic/base-files/etc/uci-defaults/99_zyxel-nwa5123-ac-slot-mirror` | One-shot: clones the newer slot's loader stub into the other loader slot |
+-- 
+2.55.0
+
